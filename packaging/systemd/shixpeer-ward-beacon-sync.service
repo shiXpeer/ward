@@ -1,0 +1,22 @@
+[Unit]
+Description=Refresh and sign Shixpeer Ward vulnerability data
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=shixpeer-ward-beacon
+Environment=HOME=/home/shixpeer-ward-beacon
+ExecStart=/home/shixpeer-ward-beacon/.shixpeer.ward/bin/shixpeer-ward-sync.sh
+UMask=0077
+TimeoutStartSec=6h
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/shixpeer-ward-beacon/.shixpeer.ward
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

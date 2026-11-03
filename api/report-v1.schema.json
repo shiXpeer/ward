@@ -1,0 +1,284 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shixpeer Ward local scan report v1",
+  "type": "object",
+  "required": [
+    "format_version",
+    "generated_at",
+    "offline",
+    "status",
+    "inventory",
+    "components",
+    "findings",
+    "coverage",
+    "confirmed",
+    "requires_review"
+  ],
+  "properties": {
+    "format_version": {
+      "const": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "offline": {
+      "const": true
+    },
+    "status": {
+      "enum": [
+        "partial",
+        "incomplete"
+      ]
+    },
+    "database": {
+      "type": "object",
+      "required": [
+        "revision",
+        "created_at",
+        "expires_at",
+        "profile",
+        "sources"
+      ],
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "profile": {
+          "enum": [
+            "all",
+            "prototype"
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "inventory": {
+      "type": "object",
+      "required": [
+        "format_version",
+        "collected_at",
+        "host",
+        "coverage"
+      ],
+      "properties": {
+        "format_version": {
+          "const": 1
+        },
+        "host": {
+          "type": "object"
+        },
+        "coverage": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/note"
+          }
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "version",
+          "origin",
+          "rules",
+          "result"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "ecosystem": {
+            "type": "string"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "rules": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "result": {
+            "enum": [
+              "NOT_CHECKED",
+              "NO_ADVISORY_FOUND",
+              "NO_MATCH_IN_AVAILABLE_RULES",
+              "REQUIRES_REVIEW",
+              "AFFECTED",
+              "INCOMPLETE"
+            ]
+          },
+          "product": {
+            "type": "string"
+          },
+          "match_version": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "required": [
+          "status",
+          "priority",
+          "component",
+          "installed_version",
+          "ecosystem",
+          "source",
+          "id",
+          "severity",
+          "known_exploited",
+          "reason",
+          "recommendation"
+        ],
+        "properties": {
+          "component": {
+            "type": "string"
+          },
+          "installed_version": {
+            "type": "string"
+          },
+          "ecosystem": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "recommendation": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "affected",
+              "review"
+            ]
+          },
+          "priority": {
+            "enum": [
+              "P0-known-exploited",
+              "P1-critical",
+              "P2-high",
+              "P3-other",
+              "P4-review"
+            ]
+          },
+          "known_exploited": {
+            "type": "boolean"
+          },
+          "fixed_versions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "epss": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "evidence": {
+            "type": "object"
+          },
+          "rule_matches": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "origin": {
+            "type": "string"
+          },
+          "match_version": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/note"
+      }
+    },
+    "confirmed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "requires_review": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "note": {
+      "type": "object",
+      "required": [
+        "code",
+        "source",
+        "detail"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "NOT_CHECKED",
+            "UNAVAILABLE",
+            "TRUNCATED",
+            "UNRESOLVED"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

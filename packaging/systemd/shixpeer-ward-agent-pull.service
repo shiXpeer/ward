@@ -1,0 +1,16 @@
+# Optional oneshot download. Do not enable its timer with the resident updater.
+[Unit]
+Description=Shixpeer Ward manual signed database download
+After=network-online.target
+[Service]
+Type=oneshot
+User=shixpeer-ward-agent
+Environment=HOME=/home/shixpeer-ward-agent
+ExecStart=/home/shixpeer-ward-agent/.shixpeer.ward/bin/shixpeer-ward-agent update
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/shixpeer-ward-agent/.shixpeer.ward
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

@@ -1,0 +1,18 @@
+{
+  "sources": [
+    {
+      "id": "cisa-kev",
+      "type": "cisa-kev",
+      "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+      "enabled": true,
+      "max_bytes": 16777216
+    },
+    {
+      "id": "osv-go",
+      "type": "osv-zip",
+      "url": "https://osv-vulnerabilities.storage.googleapis.com/Go/all.zip",
+      "enabled": false,
+      "max_bytes": 134217728
+    }
+  ]
+}

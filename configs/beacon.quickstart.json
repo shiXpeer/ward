@@ -1,0 +1,39 @@
+{
+  "sources": [
+    {
+      "id": "debian-tracker",
+      "type": "debian-tracker",
+      "url": "https://security-tracker.debian.org/tracker/data/json",
+      "enabled": true,
+      "max_bytes": 268435456
+    },
+    {
+      "id": "sofa-macos",
+      "type": "sofa",
+      "url": "https://sofafeed.macadmins.io/v1/macos_data_feed.json",
+      "enabled": true,
+      "max_bytes": 16777216
+    },
+    {
+      "id": "epss",
+      "type": "epss-gzip",
+      "url": "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz",
+      "enabled": true,
+      "max_bytes": 33554432
+    },
+    {
+      "id": "cisa-kev",
+      "type": "cisa-kev",
+      "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+      "enabled": true,
+      "max_bytes": 16777216
+    },
+    {
+      "id": "osv-go",
+      "type": "osv-zip",
+      "url": "https://storage.googleapis.com/osv-vulnerabilities/Go/all.zip",
+      "enabled": true,
+      "max_bytes": 134217728
+    }
+  ]
+}

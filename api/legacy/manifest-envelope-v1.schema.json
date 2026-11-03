@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shixpeer Ward signed manifest envelope v1",
+  "type": "object",
+  "required": ["payload", "signature"],
+  "properties": {
+    "payload": {"type": "string", "contentEncoding": "base64", "description": "Exact UTF-8 manifest JSON bytes; verify before parsing trust decisions."},
+    "signature": {"type": "string", "contentEncoding": "base64", "description": "Ed25519 signature over decoded payload bytes."}
+  },
+  "additionalProperties": false
+}

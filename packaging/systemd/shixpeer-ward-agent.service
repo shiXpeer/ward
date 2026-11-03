@@ -1,0 +1,26 @@
+[Unit]
+Description=Shixpeer Ward local security reports and signed database sync
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=shixpeer-ward-agent
+Environment=HOME=/home/shixpeer-ward-agent
+ExecStart=/home/shixpeer-ward-agent/.shixpeer.ward/bin/shixpeer-ward-agent run -feed-interval 6h -collect-interval 1h
+WorkingDirectory=/home/shixpeer-ward-agent
+UMask=0077
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/shixpeer-ward-agent/.shixpeer.ward
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+[Install]
+WantedBy=multi-user.target

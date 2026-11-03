@@ -1,0 +1,5 @@
+{
+  "sources": [
+    {"id": "demo", "type": "osv", "path": "../testdata/sources/example-osv.json", "enabled": true}
+  ]
+}

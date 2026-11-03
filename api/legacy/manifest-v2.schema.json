@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shixpeer Ward signed payload manifest v2",
+  "description": "Decoded signed payload; total expanded bytes <=16 GiB. Verify signature on original decoded payload bytes before trusting. Feed/news/shard names must match their digests.",
+  "type": "object",
+  "required": [
+    "version",
+    "revision",
+    "created_at",
+    "expires_at",
+    "feed",
+    "news"
+  ],
+  "properties": {
+    "version": {
+      "const": 2
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "base_url": {
+      "type": "string"
+    },
+    "feed": {
+      "$ref": "#/$defs/artifact"
+    },
+    "news": {
+      "$ref": "#/$defs/artifact"
+    },
+    "shards": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": [
+        "name",
+        "sha256",
+        "bytes",
+        "expanded_bytes"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^(feed-[a-f0-9]{64}\\.json\\.gz|news-[a-f0-9]{64}\\.json)$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        },
+        "expanded_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

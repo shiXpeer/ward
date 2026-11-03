@@ -1,0 +1,24 @@
+[Unit]
+Description=Shixpeer Ward read-only HTTPS publisher and agent distribution
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=shixpeer-ward-serve
+Environment=HOME=/home/shixpeer-ward-serve
+ExecStart=/home/shixpeer-ward-serve/.shixpeer.ward/bin/shixpeer-ward-beacon serve -out /home/shixpeer-ward-beacon/.shixpeer.ward/beacon/public -listen :8443 -tls-cert /home/shixpeer-ward-serve/.shixpeer.ward/pki/server.crt -tls-key /home/shixpeer-ward-serve/.shixpeer.ward/pki/server.key
+UMask=0077
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=-/home/shixpeer-ward-beacon/.shixpeer.ward/pki -/home/shixpeer-ward-beacon/.shixpeer.ward/beacon/cache -/home/shixpeer-ward-beacon/.shixpeer.ward/beacon/catalogs
+[Install]
+WantedBy=multi-user.target

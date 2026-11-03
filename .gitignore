@@ -1,0 +1,24 @@
+# Local tooling/builds
+.idea/
+.vscode/
+.DS_Store
+bin/
+dist/
+.local/
+var/
+*.log
+*.test
+coverage.out
+__pycache__/
+# Private runtime keys and local inventories never belong in source control
+*.key
+*.pem
+snapshot.json
+feed-checkpoint.json
+writer.lock
+# Historical Bash experiment is retained locally, not part of the Go product
+tests/
+
+# Private local scan outputs
+report.json
+report.md

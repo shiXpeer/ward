@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {
+      "id": "nvd",
+      "type": "nvd-years",
+      "url": "https://nvd.nist.gov/feeds/json/cve/2.0/",
+      "enabled": true,
+      "max_bytes": 268435456
+    }
+  ]
+}

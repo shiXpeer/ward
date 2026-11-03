@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shixpeer Ward normalized feed v2",
+  "type": "object",
+  "required": ["format_version", "generated_at", "sources", "records", "news"],
+  "properties": {
+    "format_version": {"const": 2},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "sources": {"type": "array", "items": {"type": "object", "required": ["id", "fetched_at", "last_attempt_at", "advisory_count"], "properties": {"id": {"type": "string", "minLength": 1}, "fetched_at": {"type": "string", "format": "date-time"}, "last_attempt_at": {"type": "string", "format": "date-time"}, "advisory_count": {"type": "integer", "minimum": 0}, "error": {"const": "sync failed"}}}},
+    "records": {"type": "array", "items": {"type": "object", "required": ["id", "evidence"], "properties": {"id": {"type": "string", "minLength": 1}, "evidence": {"type": "array", "items": {"type": "object", "required": ["source", "advisory_id", "withdrawn", "modified"]}}}}},
+    "news": {"type": "array", "items": {"type": "object", "required": ["id", "vulnerability_id", "source", "reason", "published_at", "summary"], "properties": {"reason": {"enum": ["critical_advisory", "added_to_known_exploited_catalog"]}}}}
+  }
+}
