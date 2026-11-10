@@ -3,7 +3,12 @@
 Versions follow Semantic Versioning. While pre-1.0, any breaking change is explicit
 in release notes. Software tags are `vMAJOR.MINOR.PATCH`; data tags are separate.
 
-## Unreleased (0.3.0-dev)
+## Unreleased (0.4.8-dev)
+
+- Ship a compact signed vulnerability database and partial offline host scanner.
+- Add the macOS application and optional encrypted report relay.
+
+### Earlier development
 
 - Implement streamed Canonical OSV tar.xz, Debian Tracker, Apple HTML/SOFA,
   full annual NVD, EPSS, CVE JSON 5 and direct GHSA repository adapters.

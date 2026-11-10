@@ -13,6 +13,17 @@ __pycache__/
 # Private runtime keys and local inventories never belong in source control
 *.key
 *.pem
+*.crt
+*.cer
+.env
+.env.*
+!.env.example
+*.env
+*.wdb
+*.p12
+*.pfx
+id_rsa
+id_ed25519
 snapshot.json
 feed-checkpoint.json
 writer.lock
