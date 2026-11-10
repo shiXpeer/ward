@@ -1,31 +1,39 @@
 # Shixpeer Ward
 
-Private host monitoring and an open vulnerability-data pipeline.
+Private host monitoring and a signed vulnerability-data pipeline.
 
 **[shixpeer.com](https://shixpeer.com)** · [Русский](README.ru.md) ·
-[Architecture](docs/architecture.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
+[Architecture](docs/architecture.md) · [Security](SECURITY.md) · [Privacy](PRIVACY.md) · [License](LICENSE) · [Contributing](CONTRIBUTING.md)
 
 Shixpeer Ward keeps host inventory local. A separate publisher gathers configured
 vulnerability sources and produces a compact, signed disk database for agents to download.
-It does not install updates, change firewalls, accept remote commands, or require an account.
+Ward is built by shixpeer for operators of their own Linux and macOS hosts and
+Beacon. There is no hosted Ward service or account. The agent does not install
+software updates, change firewalls or accept remote commands.
 
-Two Go applications, no Postgres, SQLite, Redis, or other database service/engine:
+Three Go programs (development version 0.4.8-dev), no Postgres, SQLite, Redis, or other database service/engine:
 
 | Application | Responsibility |
 | --- | --- |
 | `shixpeer-ward-agent` | Observe a host locally and download changed parts of signed disk snapshots |
 | `shixpeer-ward-beacon` | Aggregate configured sources, stream and normalize sources, publish indexed snapshots |
+| `shixpeer-ward-relay` | Optionally stores the latest encrypted report per configured server ID |
+
+The [macOS app](apps/macos/README.md) (version 0.1.0, `com.shixpeer.ward`)
+can scan this Mac, import reports and retrieve encrypted reports. Opening the
+Applications view can check third-party update sources. Supported updates can
+be installed explicitly in the app, which may prompt for administrator approval.
 
 **Status: partial local scanner.** Inventories OS/kernel, Debian/Ubuntu and
 Homebrew packages, macOS applications, service registries, local ports, Docker
 metadata and global npm/Python packages. Matches supported distro/language rules
 and explicitly mapped NVD CPE products locally. macOS release entries and complex
 conditions require review. Unknown identities, container packages and project
-lockfiles remain explicitly unchecked. No automatic software updates or remote commands.
+lockfiles remain explicitly unchecked. Zero findings do not establish that a host is free of vulnerabilities.
 
 ## Ubuntu deployment
 
-See the [step-by-step Ubuntu guide](docs/ubuntu-deployment.ru.md) for the split
+See the [step-by-step Ubuntu guide](docs/ubuntu-deployment.md) for the split
 Beacon publisher, signed two-command agent installation after trust provisioning,
 systemd and home-state migration. Build the Linux bundle with `make ubuntu-bundle`.
 
@@ -126,6 +134,15 @@ after synchronization. A catalog entry alone does not enable an integration.
 limits, failures, attribution and what “urgent” means. [Operations](docs/operations.md)
 explains state paths, schedules, process isolation and recovery.
 
+## Compact database
+
+Signed protocol v3 and disk format 3 replace the older JSON feed. Import runs on
+Beacon. The agent stores compact buckets on disk and looks up records from the
+index. `-profile all` publishes every supported source. `-profile prototype`
+keeps Ubuntu 24.04 LTS, Debian 12/bookworm and macOS rules. A profile is not
+chosen from the host inventory. `lookup` reads records; `scan` is the local
+inventory report.
+
 ## Direct HTTPS or GitHub
 
 Beacon exports the same files for either route:
@@ -149,6 +166,8 @@ A feed/mirror still sees the downloader's IP, timing, and ordinary HTTP/TLS meta
 ```text
 cmd/shixpeer-ward-agent/       agent entry point
 cmd/shixpeer-ward-beacon/      Beacon entry point
+cmd/shixpeer-ward-relay/       encrypted report relay
+apps/macos/                   native macOS application
 internal/agent/               observation, download and local state
 internal/beacon/              source adapters, normalization, sync and serving
 internal/snapshot/            signed immutable disk artifacts
@@ -169,7 +188,7 @@ Use `migrate-home` to preserve legacy trust and anti-rollback checkpoints.
 ```sh
 make fmt
 make check
-make build VERSION=0.4.0-dev
+make build VERSION=0.4.8-dev
 ```
 
 Tests use local TLS servers and generated temporary keys, not live upstream services.
@@ -178,4 +197,9 @@ Use Conventional Commits, Semantic Versioning and the [release checklist](docs/r
 Dependencies and workflow actions must be reviewed and pinned. Source data retains
 upstream provenance; check its redistribution terms separately from the code license.
 
-Source-available under the [PolyForm Internal Use License 1.0.0](LICENSE). The licensor is shixpeer. See [NOTICE](NOTICE).
+Source-available under the [PolyForm Internal Use License 1.0.0](LICENSE).
+The licensor is shixpeer. Internal business use is permitted. The license does
+not grant a right to distribute the software or to offer it as a service;
+additional permissions are requested through [shixpeer.com](https://shixpeer.com).
+This is not an OSI open-source license. Upstream vulnerability data keeps its
+own terms. See [NOTICE](NOTICE).

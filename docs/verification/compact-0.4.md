@@ -1,5 +1,7 @@
 # Compact database verification — 0.4.0-dev, 2026-10-30
 
+> Historical verification notes. For deployment and current procedures, see the [documentation index](../README.md).
+
 Executed on macOS arm64, Go 1.26.10. Measurements use `/usr/bin/time -l`; macOS
 reports maximum RSS in **bytes**. MiB below means 1,048,576 bytes. Download timings
 use a local HTTPS server with normal certificate validation and a separately pinned

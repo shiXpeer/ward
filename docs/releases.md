@@ -1,12 +1,8 @@
 # Source, binary and data releases
 
-No repository has been created or release published by generating this scaffold.
-There is currently no Git history in the supplied local directory. The repository
-owner chooses the actual GitHub owner/name, branch protections and security settings.
-
 ## Source repository
 
-Before the first commit:
+Before the first public push:
 
 1. Review `.gitignore`, staged files, licenses and `NOTICE`.
 2. Exclude private keys, local data, real inventories and editor/build directories.
@@ -19,11 +15,11 @@ The historical Bash experiment remains on the developer machine under ignored
 
 ## Software release
 
-Use Semantic Versioning: `v0.2.0`, then an increment matching the change. Document
+Use Semantic Versioning: choose a tag from the 0.4 series matching the change. Document
 breaking command/schema/state changes explicitly. Do not label a scaffold as stable.
 
 The tag workflow runs checks, builds Linux/macOS amd64/arm64 binaries with no CGO,
-packages licenses/notices, READMEs, default source configurations, documentation, schemas and the public demo fixture, writes SHA-256 checksums and creates a GitHub release.
+packages the three Go binaries (agent, Beacon and relay), licenses/notices, READMEs, default source configurations, documentation, schemas and the public demo fixture, writes SHA-256 checksums and creates a GitHub release.
 It has no feed-signing key and does not publish a database. Pre-release tags with
 `-...` are marked prerelease. GitHub Actions are pinned to reviewed commits.
 Checksums detect corruption; binary-release attestation/signing is not yet configured.

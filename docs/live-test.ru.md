@@ -1,5 +1,7 @@
 # Миграция на 0.4
 
+> Historical verification notes. For deployment and current procedures, see the [documentation index](README.md).
+
 Этот прежний журнал запуска относится к JSON feed v3 и manifest v2.
 Он не является инструкцией для текущей версии. Используйте команды из
 [README](../README.ru.md) и [протокол v3](distribution.md).
@@ -15,7 +17,7 @@
 Собрать оба приложения:
 
 ```sh
-# Run from the repository root.
+# Запускайте команды из каталога репозитория.
 make build
 ```
 
@@ -72,7 +74,7 @@ bin/shixpeer-ward-beacon serve \
 Во втором терминале:
 
 ```sh
-# Run from the repository root.
+# Запускайте команды из каталога репозитория.
 bin/shixpeer-ward-agent pull \
   -state .local/real-v3/agent \
   -feed-url https://localhost:8443/v1/manifest.json \

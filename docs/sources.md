@@ -111,7 +111,8 @@ collapsed into a single CVE. Preserve original-source evidence and withdrawals.
 Aggregate display severity uses the first available configured source, not a host
 risk verdict. EPSS is probability, KEV is observed exploitation evidence. News
 includes recent explicit critical severity and KEV additions; it is not a complete
-news or notification service. Installed-version matching remains separate work.
+news or notification service. Installed-version matching for supported ecosystems
+is partial and is described in [scanning](scanning.md).
 
 ## Redistribution
 

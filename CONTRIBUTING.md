@@ -45,6 +45,15 @@ coverage for parsing, network policy, rollback, and persistence changes.
 Document new limits and unsupported coverage. Use `internal/` for implementation;
 `pkg/` contains versioned data contracts, not a promise that every Go API is stable.
 
+## License
+
+Shixpeer Ward is source-available under the PolyForm Internal Use License 1.0.0.
+The licensor is shixpeer. That license permits internal business use and does not
+grant recipients a right to distribute the software. Additional permissions are
+requested through [shixpeer.com](https://shixpeer.com). Contributions to this
+repository are accepted under those same terms. Upstream vulnerability data keeps
+its own terms.
+
 ## Forks
 
 A fork builds locally without contacting shixpeer.com. The Go module path identifies

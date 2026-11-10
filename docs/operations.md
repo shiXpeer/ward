@@ -13,8 +13,9 @@ sudo changes that account's storage. Explicit CLI overrides remain available.
 | Beacon state/cache/public files | ~/.shixpeer.ward/beacon/ |
 | Beacon sources | ~/.shixpeer.ward/config/beacon.json |
 
-See [Ubuntu deployment](ubuntu-deployment.ru.md) for complete commands, binaries,
-trust bootstrap, separate publisher/HTTPS accounts and installation services.
+See [Ubuntu deployment](ubuntu-deployment.md) for binaries, trust bootstrap,
+separate publisher and HTTPS accounts, and installation services. The Russian
+copy is [ubuntu-deployment.ru.md](ubuntu-deployment.ru.md).
 
 ## Agent commands
 

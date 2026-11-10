@@ -1,5 +1,7 @@
 # Ubuntu deployment validation — 2026-11-02
 
+> Historical verification notes. For deployment and current procedures, see the [documentation index](../README.md).
+
 Validation performed locally, without deploying to a remote server.
 
 - `make check`: gofmt, go vet, Go tests with race detector.
