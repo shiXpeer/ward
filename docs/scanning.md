@@ -15,7 +15,7 @@ The default is `~/.shixpeer.ward/agent/` on Linux/macOS, with configuration in
 `~/.shixpeer.ward/config/agent.json`; root uses `/root/.shixpeer.ward/`.
 `run` now performs initial update then periodic full scans/reports and independent
 database updates. Use `migrate-home` to preserve legacy trust/checkpoints.
-See [Ubuntu deployment](ubuntu-deployment.ru.md).
+See [Ubuntu deployment](ubuntu-deployment.uk.md).
 
 ## Console summary
 

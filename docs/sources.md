@@ -120,7 +120,7 @@ Ward's PolyForm Internal Use license does not relicense upstream data. Canonical
 CC-BY-SA-4.0; GitHub advisories use CC-BY-4.0; OSV aggregates sources with different
 terms. Keep attribution and review redistribution obligations before publishing a
 combined database. Export advisories only, never inventory, private source caches,
-credentials or keys. See the [Russian source review](source-catalog.ru.md) and the
+credentials or keys. See the [Ukrainian source review](source-catalog.uk.md) and the
 catalog's documentation links for authoritative upstream references.
 
 CLI export/run publication refuses a saved feed containing source errors. A partial

@@ -35,7 +35,7 @@ jobs:
                 -ldflags "-s -w -X shixpeer.com/ward/internal/buildinfo.Version=$version" \
                 -o "dist/$folder/shixpeer-ward-$app" "./cmd/shixpeer-ward-$app"
             done
-            cp LICENSE NOTICE THIRD_PARTY_NOTICES.md PRIVACY.md README.md README.ru.md CHANGELOG.md "dist/$folder/"
+            cp LICENSE NOTICE THIRD_PARTY_NOTICES.md PRIVACY.md README.md README.uk.md CHANGELOG.md "dist/$folder/"
             cp -R configs docs api testdata "dist/$folder/"
             tar -C dist -czf "dist/$folder.tar.gz" "$folder"
           done

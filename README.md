@@ -2,7 +2,7 @@
 
 Private host monitoring and a signed vulnerability-data pipeline.
 
-**[shixpeer.com](https://shixpeer.com)** · [Русский](README.ru.md) ·
+**[shixpeer.com](https://shixpeer.com)** · [Українська](README.uk.md) ·
 [Architecture](docs/architecture.md) · [Security](SECURITY.md) · [Privacy](PRIVACY.md) · [License](LICENSE) · [Contributing](CONTRIBUTING.md)
 
 Shixpeer Ward keeps host inventory local. A separate publisher gathers configured

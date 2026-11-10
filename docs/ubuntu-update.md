@@ -3,7 +3,7 @@
 Commands from a Mac run from the project root. Use the same SSH hosts, ports
 and HTTPS address as the first installation. Updating system packages,
 rebooting Ubuntu, deleting the database or changing keys is not required.
-Russian: [ubuntu-update.ru.md](ubuntu-update.ru.md).
+Ukrainian: [ubuntu-update.uk.md](ubuntu-update.uk.md).
 
 1. Build the archive:
 

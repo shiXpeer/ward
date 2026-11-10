@@ -3,7 +3,7 @@
 For Ubuntu 24.04 with systemd, amd64 or arm64. An administrator runs the
 commands below. Developing on a Mac does not mean anything is already installed
 on the servers. Project: https://shixpeer.com. The servers do not need Go; they
-use prebuilt binaries. Russian: [ubuntu-deployment.ru.md](ubuntu-deployment.ru.md).
+use prebuilt binaries. Ukrainian: [ubuntu-deployment.uk.md](ubuntu-deployment.uk.md).
 
 ## Quick path from a Mac
 

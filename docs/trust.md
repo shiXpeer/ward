@@ -78,4 +78,4 @@ for audit. This is an explicit operator migration, not a downloaded instruction.
 
 Agent installers require a separately trusted script SHA256 before execution, then
 a provisioned public key or pinned SPKI SHA256. Signed release manifests bind Linux
-architecture, hashes, sizes and validity. See [Ubuntu deployment](ubuntu-deployment.ru.md).
+architecture, hashes, sizes and validity. See [Ubuntu deployment](ubuntu-deployment.uk.md).

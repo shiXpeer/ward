@@ -57,7 +57,7 @@ done
 [[ -n $seen_amd64 && -n $seen_arm64 ]] || { echo 'Release must include both supported architectures.' >&2; exit 1; }
 cp "$tmp/$name" "$tmp/agent"
 if [[ $user_name == shixpeer-ward-agent ]] && { id ward-agent >/dev/null 2>&1 || [[ -e /home/ward-agent ]]; }; then
-  echo 'Legacy agent account/state found. Follow the migration steps in docs/ubuntu-deployment.ru.md.' >&2
+  echo 'Legacy agent account/state found. Follow the migration steps in docs/ubuntu-deployment.uk.md.' >&2
   exit 1
 fi
 # Mutate the host only after validating all downloaded code.

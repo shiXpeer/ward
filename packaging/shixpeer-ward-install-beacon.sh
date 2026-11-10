@@ -15,7 +15,7 @@ case $(uname -m) in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) exit 1;;
 [[ -f $bundle/bin/shixpeer-ward-beacon-linux-$arch && -f $bundle/configs/beacon.default.json ]] || { echo 'Release bundle files missing.' >&2; exit 1; }
 for legacy in ward-beacon ward-serve; do
   if id "$legacy" >/dev/null 2>&1 || [[ -e /home/$legacy ]]; then
-    echo 'Legacy Beacon accounts/state found. Follow the migration steps in docs/ubuntu-deployment.ru.md before reinstalling.' >&2
+    echo 'Legacy Beacon accounts/state found. Follow the migration steps in docs/ubuntu-deployment.uk.md before reinstalling.' >&2
     exit 1
   fi
 done

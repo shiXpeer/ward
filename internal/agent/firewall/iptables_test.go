@@ -6,6 +6,7 @@ import (
 )
 
 func TestOriginalPortAndSourceAfterDNAT(t *testing.T) {
+	// Source examples stay in RFC 5737 documentation ranges.
 	tables, err := Parse(`*nat
 :PREROUTING ACCEPT [0:0]
 -A PREROUTING -p tcp --dport 9090 -j DNAT --to-destination 172.19.0.2:8080

@@ -24,6 +24,7 @@ func TestSocketParsersFamiliesAndVisibility(t *testing.T) {
 	if s.Listeners[2].Process != "sshd" || s.Listeners[3].Family != "IPv6" || s.Listeners[3].BindScope != "loopback" {
 		t.Fatal(s.Listeners)
 	}
+	// Public examples stay in RFC 5737 documentation ranges.
 	for host, want := range map[string]string{"0.0.0.0": "wildcard", "::": "wildcard", "127.0.0.1": "loopback", "::1": "loopback", "172.19.0.1": "private", "198.51.100.171": "public-address"} {
 		if got := bindScope(host); got != want {
 			t.Fatal(host, got)
