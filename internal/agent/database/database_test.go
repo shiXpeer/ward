@@ -60,7 +60,7 @@ func TestStreamInstallIncrementalLookupAndTamper(t *testing.T) {
 	defer server.Close()
 	c := Client{URL: server.URL + "/v1/manifest.json", HTTP: server.Client(), TrustedKey: pub, Dir: filepath.Join(dir, "agent")}
 	result, e := c.Update(ctx)
-	if e != nil || result.Downloaded != 2 {
+	if e != nil || result.Downloaded != 2 || !result.NewRevision {
 		t.Fatal(result, e)
 	}
 	before, _ := os.ReadFile(filepath.Join(c.Dir, "current.json"))
@@ -71,13 +71,21 @@ func TestStreamInstallIncrementalLookupAndTamper(t *testing.T) {
 	}
 	requests.Store(0)
 	result, e = c.Update(ctx)
-	if e != nil || result.Downloaded != 0 || requests.Load() != 0 {
+	if e != nil || result.Downloaded != 0 || requests.Load() != 0 || result.NewRevision {
 		t.Fatal(result, e, requests.Load())
 	}
 	second := makeCatalog(t, filepath.Join(dir, "second"), "2")
 	m2, e := exporter.Export(ctx, public, second, key, "", time.Hour, now.Add(time.Second))
 	if e != nil {
 		t.Fatal(e)
+	}
+	result, e = c.Check(ctx)
+	if e != nil || !result.Changed || result.NewRevision || result.Revision != m2.Revision || result.Downloaded != 0 || requests.Load() != 0 {
+		t.Fatal("manifest-only check did not report the new revision without downloading", result, e, requests.Load())
+	}
+	unchanged, e := os.ReadFile(filepath.Join(c.Dir, "current.json"))
+	if e != nil || string(before) != string(unchanged) {
+		t.Fatal("manifest-only check changed the installed database", e)
 	}
 	var changed snapshot.Object
 	for _, o := range m2.Objects {
@@ -102,7 +110,7 @@ func TestStreamInstallIncrementalLookupAndTamper(t *testing.T) {
 	var progress []Progress
 	c.OnProgress = func(event Progress) { progress = append(progress, event) }
 	result, e = c.Update(ctx)
-	if e != nil || result.Downloaded != 1 || requests.Load() != 1 {
+	if e != nil || result.Downloaded != 1 || requests.Load() != 1 || !result.NewRevision {
 		t.Fatal(result, e, requests.Load())
 	}
 	if len(progress) < 5 || progress[0].Stage != "manifest" || progress[1].Stage != "planning" {
@@ -122,6 +130,9 @@ func TestStreamInstallIncrementalLookupAndTamper(t *testing.T) {
 	atomicfile.Write(filepath.Join(public, "manifest.json"), old, 0644)
 	if _, e = c.Update(ctx); e == nil {
 		t.Fatal("rollback accepted")
+	}
+	if _, e = c.Check(ctx); e == nil {
+		t.Fatal("manifest-only check accepted a rollback")
 	}
 	conflict := m2
 	conflict.Generation = snapshot.Digest([]byte("conflict"))

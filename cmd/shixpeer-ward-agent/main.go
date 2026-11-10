@@ -58,11 +58,11 @@ func run(args []string) error {
 		return nil
 	}
 	if args[0] == "help" || args[0] == "--help" {
-		fmt.Println("Shixpeer Ward — https://shixpeer.com\nCommands: setup (save download settings), update (signed database, changed objects only; default), pull (alias), scan (offline system report), collect (offline), lookup (offline), probe (explicit TCP check), run (resident update + scan), migrate-home (copy legacy state into home).\nUse COMMAND -h for options. No software updates or remote commands.")
+		fmt.Println("Shixpeer Ward — https://shixpeer.com\nCommands: setup (save download settings), update (signed database, changed objects only; default), pull (alias), check-update (signed manifest only), scan (offline system report), collect (offline), lookup (offline), probe (explicit TCP check), run (resident update + scan), migrate-home (copy legacy state into home).\nUse COMMAND -h for options. No software updates or remote commands.")
 		return nil
 	}
 	cmd := args[0]
-	if cmd != "collect" && cmd != "pull" && cmd != "update" && cmd != "setup" && cmd != "run" && cmd != "lookup" && cmd != "scan" {
+	if cmd != "collect" && cmd != "pull" && cmd != "update" && cmd != "check-update" && cmd != "setup" && cmd != "run" && cmd != "lookup" && cmd != "scan" {
 		return errors.New("unknown command")
 	}
 	if paths.Root() == "" {
@@ -203,7 +203,7 @@ func run(args []string) error {
 		}
 		feeds = &database.Client{URL: *raw, HTTP: httpc, TrustedKey: pub, AllowedHosts: hosts, Dir: filepath.Join(*dir, "database")}
 	}
-	if cmd == "pull" || cmd == "update" {
+	if cmd == "pull" || cmd == "update" || cmd == "check-update" {
 		if feeds == nil {
 			return errors.New("no download source configured: run setup -feed-url HTTPS_URL -trusted-key feed.pub once")
 		}
@@ -211,7 +211,23 @@ func run(args []string) error {
 			encoder := json.NewEncoder(os.Stderr)
 			feeds.OnProgress = func(p database.Progress) { _ = encoder.Encode(p) }
 		}
-		result, e := feeds.Update(ctx)
+		update := feeds.Update
+		if cmd == "check-update" {
+			update = feeds.Check
+		}
+		result, e := update(ctx)
+		if e == nil && *progressJSON {
+			progress := database.Progress{Stage: "updated", Done: result.WireBytes, Total: result.WireBytes}
+			if cmd == "check-update" {
+				progress.Stage = "current"
+				if result.Changed {
+					progress.Stage = "available"
+				}
+			} else if result.NewRevision {
+				progress.Component = "new-revision"
+			}
+			_ = json.NewEncoder(os.Stderr).Encode(progress)
+		}
 		if e != nil {
 			return e
 		}

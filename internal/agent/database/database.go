@@ -41,6 +41,7 @@ type Client struct {
 }
 type Result struct {
 	Changed       bool              `json:"changed"`
+	NewRevision   bool              `json:"new_revision,omitempty"`
 	Revision      int64             `json:"revision"`
 	Objects       int               `json:"objects"`
 	Downloaded    int               `json:"downloaded"`
@@ -81,14 +82,20 @@ func current(dir string, key ed25519.PublicKey, fresh bool, now time.Time) (poin
 	return p, m, e
 }
 func (c *Client) Update(ctx context.Context) (Result, error) {
-	return c.update(ctx, false)
+	return c.update(ctx, false, false)
 }
 
 // Poll checks the signed manifest without touching installed objects on a no-op.
 func (c *Client) Poll(ctx context.Context) (Result, error) {
-	return c.update(ctx, true)
+	return c.update(ctx, true, false)
 }
-func (c *Client) update(ctx context.Context, poll bool) (Result, error) {
+
+// Check verifies the remote manifest and reports whether a newer revision is available.
+func (c *Client) Check(ctx context.Context) (Result, error) {
+	return c.update(ctx, true, true)
+}
+
+func (c *Client) update(ctx context.Context, poll, checkOnly bool) (Result, error) {
 	var result Result
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
@@ -181,6 +188,11 @@ func (c *Client) update(ctx context.Context, poll bool) (Result, error) {
 			return result, e
 		}
 	}
+	if checkOnly {
+		result := resultFor(m)
+		result.Changed = m.Revision > previous.Revision
+		return result, nil
+	}
 	objects := filepath.Join(c.Dir, "objects")
 	if e = os.MkdirAll(objects, 0700); e != nil {
 		return result, e
@@ -270,6 +282,7 @@ func (c *Client) update(ctx context.Context, poll bool) (Result, error) {
 	_ = prune(objects, m.Objects, nil)
 
 	result.Changed = result.Downloaded > 0 || !slices.Equal(previous.Objects, m.Objects)
+	result.NewRevision = m.Revision > previous.Revision
 	result.Revision = m.Revision
 	result.Objects = len(m.Objects)
 	result.Profile = m.Profile
