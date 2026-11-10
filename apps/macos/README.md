@@ -20,6 +20,18 @@ Docker Desktop update availability is checked through the Docker-signed
 updater bundled with the installed application, using `desktop update --check-only`.
 Ward never installs a Docker Desktop update.
 
+## Menu bar and scheduled maintenance
+
+Open **Settings** in the sidebar to show Ward in the menu bar and set separate
+intervals for signed database checks, offline system scans, and application
+version checks. These options start off and run while Ward is open, even with
+its window closed. With the menu bar icon enabled, closing the last window
+hides Ward from the Dock. Database checks can fetch just the signed manifest
+or automatically download and verify the new database. An optional offline
+scan runs once after Ward installs a newer signed database revision. The menu bar provides
+one-off checks, updates, scans, and cancellation for a running database or
+system operation. Checking application versions does not install updates.
+
 ## Optional encrypted report relay
 
 Build the separate service with `go build -o bin/shixpeer-ward-relay

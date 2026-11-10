@@ -1,6 +1,8 @@
 import SwiftUI
+import Combine
 import CryptoKit
 import Security
+import ServiceManagement
 import UniformTypeIdentifiers
 
 struct WardError: LocalizedError {
@@ -317,7 +319,97 @@ struct ScanProgress: Decodable, Sendable {
     }
 }
 
+private struct WardPreferences: Codable {
+    var menuBar = false
+    var databaseMinutes = 0
+    var downloadDatabase = false
+    var scanMinutes = 0
+    var scanAfterDatabaseUpdate: Bool? = nil
+    var applicationMinutes = 0
+
+    var scanNewDatabase: Bool {
+        get { scanAfterDatabaseUpdate ?? false }
+        set { scanAfterDatabaseUpdate = newValue }
+    }
+
+    static let key = "ward.maintenance.preferences.v1"
+
+    static func load() -> Self {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let value = try? JSONDecoder().decode(Self.self, from: data) else { return .init() }
+        return value
+    }
+}
+
 @MainActor final class WardModel: ObservableObject {
+    @Published fileprivate var preferences = WardPreferences.load() {
+        didSet {
+            if let data = try? JSONEncoder().encode(preferences) {
+                UserDefaults.standard.set(data, forKey: WardPreferences.key)
+            }
+            if preferences.databaseMinutes != oldValue.databaseMinutes { schedule(.database) }
+            if preferences.scanMinutes != oldValue.scanMinutes { schedule(.scan) }
+            if preferences.applicationMinutes != oldValue.applicationMinutes { schedule(.applications) }
+        }
+    }
+    private enum Maintenance: CaseIterable, Hashable { case database, scan, applications }
+    private var nextMaintenance: [Maintenance: Date] = [:]
+    private var maintenanceTimer: Task<Void, Never>?
+    @Published private(set) var databaseUpdateAvailable = false
+    @Published fileprivate var appUpdateChecks = AppUpdateStore.load()?.results ?? [:]
+    @Published private(set) var checkingAppVersions = false
+    @Published private(set) var applicationUpdateNote = ""
+    @Published fileprivate var installingApplication = false
+
+    private func interval(_ job: Maintenance) -> Int {
+        switch job {
+        case .database: preferences.databaseMinutes
+        case .scan: preferences.scanMinutes
+        case .applications: preferences.applicationMinutes
+        }
+    }
+
+    private func schedule(_ job: Maintenance) {
+        let minutes = interval(job)
+        nextMaintenance[job] = minutes > 0 ? Date().addingTimeInterval(Double(minutes) * 60) : nil
+    }
+
+    private func runScheduledMaintenance() async {
+        guard !busy, !checkingAppVersions, !installingApplication else { return }
+        let now = Date()
+        guard let due = nextMaintenance.min(by: { $0.value < $1.value }), due.value <= now else { return }
+        let job = due.key
+        schedule(job)
+        switch job {
+        case .database:
+            await localScan(update: true, updateOnly: true, checkOnly: !preferences.downloadDatabase, background: true)
+        case .scan:
+            await localScan(update: false, background: true)
+        case .applications:
+            await checkApplicationVersions()
+        }
+    }
+
+    @Published private(set) var loginStatus = SMAppService.mainApp.status
+
+    func refreshLoginStatus() {
+        let status = SMAppService.mainApp.status
+        if status != loginStatus { loginStatus = status }
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        defer { refreshLoginStatus() }
+        do {
+            if enabled { try service.register() }
+            else { try service.unregister() }
+        } catch {
+            message = "Could not change launch at login: " + error.localizedDescription
+        }
+    }
+
+    var launchAtLogin: Bool { loginStatus == .enabled || loginStatus == .requiresApproval }
+
     @Published var beacons: [Beacon] = []
     @Published var devices: [Device] = []
     @Published var selection: String? = "home"
@@ -384,6 +476,14 @@ struct ScanProgress: Decodable, Sendable {
             devices.append(Device(id: "local", name: "This Mac", report: report))
         }
         loadImports()
+        for job in Maintenance.allCases { schedule(job) }
+        maintenanceTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                guard self != nil else { return }
+                await self?.runScheduledMaintenance()
+            }
+        }
     }
     func add(_ beacon: Beacon, token: String) throws {
         _ = try Wire.origin(beacon.feed)
@@ -607,6 +707,43 @@ struct ScanProgress: Decodable, Sendable {
         }
         return path
     }
+    fileprivate func checkApplicationVersions(_ provided: [Report.Inventory.Application]? = nil, showProgress: Bool = false) async {
+        guard !checkingAppVersions, !installingApplication, !busy else { return }
+        checkingAppVersions = true
+        defer {
+            checkingAppVersions = false
+            if showProgress { applicationCheckProgress = nil }
+        }
+        let apps: [Report.Inventory.Application]
+        if let provided {
+            apps = provided
+        } else {
+            let scanned = devices.first(where: { $0.id == "local" })?.report.inventory.applications ?? []
+            apps = scanned + outsideApplications(known: Set(scanned.map(\.identifier)), includeStandardLocations: true)
+        }
+        let jobs = updateJobs(for: apps)
+        guard !jobs.isEmpty else {
+            applicationUpdateNote = "No application update channels found."
+            return
+        }
+        if showProgress { applicationCheckProgress = (0, jobs.count) }
+        applicationUpdateNote = "Checking \(jobs.count.formatted()) application update channels."
+        let results = await withTaskGroup(of: (String, AppUpdateRecord).self) { group in
+            for job in jobs { group.addTask { (job.id, await job.lookup()) } }
+            var found: [String: AppUpdateRecord] = [:]
+            for await (id, record) in group {
+                found[id] = record
+                if showProgress { applicationCheckProgress = (found.count, jobs.count) }
+            }
+            return found
+        }
+        appUpdateChecks.merge(results) { _, new in new }
+        AppUpdateStore.save(appUpdateChecks)
+        updateAppBadge(appUpdateChecks, for: Set(apps.map(\.identifier)))
+        let available = results.values.filter(\.newer).count
+        applicationUpdateNote = "Checked \(jobs.count.formatted()) channels · \(available.formatted()) updates available."
+    }
+
     func dismissScanIssue() { scanIssue = nil }
 
     private func trackScanProcess(_ process: Process) {
@@ -627,8 +764,8 @@ struct ScanProgress: Decodable, Sendable {
         if let scanProcess, scanProcess.isRunning { scanProcess.terminate() }
     }
 
-    func localScan(update: Bool, updateOnly: Bool = false) async {
-        guard !busy else { return }
+    func localScan(update: Bool, updateOnly: Bool = false, checkOnly: Bool = false, background: Bool = false) async {
+        guard !busy, !checkingAppVersions, !installingApplication else { return }
         busy = true
         message = ""
         let minimumUpdateEnd = ContinuousClock.now + .milliseconds(900)
@@ -639,7 +776,8 @@ struct ScanProgress: Decodable, Sendable {
             scanningMac = true
             scanIssue = nil
         }
-        activity = update ? "Updating signed database…" : "Scanning this Mac…"
+        activity = update ? (checkOnly ? "Checking for a database update…" : "Updating signed database…") : "Scanning this Mac…"
+        var scanAfterUpdate = false
         defer {
             scanProcess = nil
             updatingScanDatabase = false
@@ -663,7 +801,7 @@ struct ScanProgress: Decodable, Sendable {
                 if !beacon.caFile.isEmpty { options += ["-ca-file", try trustFile(beacon.caFile, named: "ca.crt")] }
             }
             if update {
-                let result = try await Self.run(agent, ["update", "-progress-json"] + options,
+                let result = try await Self.run(agent, [checkOnly ? "check-update" : "update", "-progress-json"] + options,
                                                 onStart: { [weak self] process in
                     self?.trackScanProcess(process)
                 }, onProgress: { [weak self] event in
@@ -671,19 +809,29 @@ struct ScanProgress: Decodable, Sendable {
                 })
                 guard !cancellingScan else { return }
                 guard result == 0 else { throw WardError("Signed database update failed. Check the Beacon address, TLS CA and signing key.") }
+                if checkOnly {
+                    databaseUpdateAvailable = scanProgress?.stage == "available"
+                    showNotice(databaseUpdateAvailable ? "A signed database update is available." : "Signed database is up to date.")
+                    return
+                }
+                databaseUpdateAvailable = false
+                let installedNewRevision = scanProgress?.stage == "updated" && scanProgress?.component == "new-revision"
+                scanAfterUpdate = updateOnly && installedNewRevision && preferences.scanNewDatabase
                 if ContinuousClock.now < minimumUpdateEnd {
                     scanProgress = ScanProgress(stage: "updated", component: nil,
                                                 done: scanProgress?.done ?? 0, total: scanProgress?.total ?? 0,
                                                 matches: nil, review: nil, seconds: nil)
                     try await ContinuousClock().sleep(until: minimumUpdateEnd)
                 }
-                if updateOnly {
-                    showNotice("Signed database updated.")
+                if updateOnly && !scanAfterUpdate {
+                    showNotice(installedNewRevision ? "Signed database updated." : "Signed database is up to date.")
                     return
                 }
                 scanProgress = nil
                 updatingScanDatabase = false
-                activity = "Scanning this Mac…"
+                scanningMac = true
+                scanIssue = nil
+                activity = scanAfterUpdate ? "Scanning this Mac with the new database…" : "Scanning this Mac…"
             }
             let reportURL = dest.appendingPathComponent("report.json")
             let previous = try? reportURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
@@ -698,10 +846,11 @@ struct ScanProgress: Decodable, Sendable {
             guard current != nil, current != previous else { throw WardError("The agent did not produce a fresh report.") }
             let report = try Wire.decode(Data(contentsOf: reportURL))
             verifiedFormulas.removeAll()
-            devicePath = []
+            if !background && !scanAfterUpdate { devicePath = [] }
             put(Device(id: "local", name: "This Mac", report: report))
             if result == 0 {
-                selection = "local"
+                if !background && !scanAfterUpdate { selection = "local" }
+                if scanAfterUpdate { showNotice("System scan completed with the new database.") }
             } else {
                 scanIssue = ScanIssue(title: "Scan incomplete",
                                       detail: "See Coverage for details. Use Update Database if the signed database is missing or expired.",
@@ -709,7 +858,7 @@ struct ScanProgress: Decodable, Sendable {
             }
         } catch {
             guard !cancellingScan else { return }
-            if updateOnly {
+            if updateOnly && !scanAfterUpdate {
                 message = error.localizedDescription
             } else {
                 scanIssue = ScanIssue(title: updatingScanDatabase ? "Database update failed" : "Scan failed",
@@ -957,7 +1106,19 @@ struct ScanProgress: Decodable, Sendable {
     }
 }
 
-final class WardAppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate {
+    private var statusMenu: WardStatusMenu?
+
+    func connectStatusMenu(to model: WardModel, openSettings: @escaping () -> Void) {
+        if let statusMenu {
+            statusMenu.openSettings = openSettings
+        } else {
+            statusMenu = WardStatusMenu(model: model, openSettings: openSettings)
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let url = Bundle.main.url(forResource: "WardMatte", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
@@ -970,15 +1131,250 @@ final class WardAppDelegate: NSObject, NSApplicationDelegate {
     @NSApplicationDelegateAdaptor(WardAppDelegate.self) private var appDelegate
     @StateObject private var model = WardModel()
     var body: some Scene {
-        WindowGroup("Shixpeer Ward") {
-            Dashboard(model: model)
-                .environmentObject(model)
-                .frame(minWidth: 820, minHeight: 540)
-                .focusEffectDisabled()
+        WindowGroup("Shixpeer Ward", id: "ward-main") {
+            WardMainWindow(model: model, appDelegate: appDelegate)
         }
         .windowStyle(.hiddenTitleBar)
     }
 }
+
+private struct WardMainWindow: View {
+    @ObservedObject var model: WardModel
+    let appDelegate: WardAppDelegate
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Dashboard(model: model)
+            .environmentObject(model)
+            .frame(minWidth: 820, minHeight: 540)
+            .focusEffectDisabled()
+            .onAppear {
+                if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+                appDelegate.connectStatusMenu(to: model) {
+                    model.selection = "settings"
+                    if let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "Shixpeer Ward" }) {
+                        window.makeKeyAndOrderFront(nil)
+                    } else {
+                        openWindow(id: "ward-main")
+                    }
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+    }
+}
+
+@MainActor private final class WardStatusMenu: NSObject, NSMenuDelegate {
+    private weak var model: WardModel?
+    var openSettings: () -> Void
+    private var observer: AnyCancellable?
+    private var windowObserver: AnyCancellable?
+    private var item: NSStatusItem?
+    private var refreshPending = false
+    private let menu = NSMenu()
+
+    init(model: WardModel, openSettings: @escaping () -> Void) {
+        self.model = model
+        self.openSettings = openSettings
+        super.init()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        observer = model.objectWillChange.sink { [weak self] in
+            self?.scheduleRefresh()
+        }
+        windowObserver = NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)
+            .sink { [weak self] _ in self?.scheduleDockRefresh() }
+        refresh()
+    }
+
+    private func scheduleDockRefresh() {
+        Task { @MainActor [weak self] in self?.refreshDockVisibility() }
+    }
+
+    private func refreshDockVisibility() {
+        guard let model else { return }
+        let hasWindow = NSApp.windows.contains { $0.isVisible && $0.canBecomeKey && $0.styleMask.contains(.titled) }
+        let policy: NSApplication.ActivationPolicy = model.preferences.menuBar && !hasWindow ? .accessory : .regular
+        if NSApp.activationPolicy() != policy { NSApp.setActivationPolicy(policy) }
+    }
+
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            refreshPending = false
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        guard let model else { return }
+        guard model.preferences.menuBar else {
+            if let item {
+                NSStatusBar.system.removeStatusItem(item)
+                self.item = nil
+                if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+            }
+            return
+        }
+        if item == nil {
+            item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            item?.menu = menu
+        }
+        let symbol: String
+        let status: String
+        if model.updatingScanDatabase {
+            symbol = "arrow.triangle.2.circlepath"; status = model.activity
+        } else if model.scanningMac {
+            symbol = "magnifyingglass.circle.fill"; status = model.activity
+        } else if model.checkingAppVersions {
+            symbol = "macwindow.badge.plus"; status = "Checking application versions"
+        } else if model.databaseUpdateAvailable {
+            symbol = "shield.lefthalf.filled"; status = "Database update available"
+        } else {
+            symbol = "shield"; status = "Ready"
+        }
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        image?.isTemplate = true
+        item?.button?.image = image
+        item?.button?.toolTip = "Shixpeer Ward · " + status
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let model else { return }
+        menu.removeAllItems()
+        model.refreshLoginStatus()
+        let unavailable = model.busy || model.checkingAppVersions || model.installingApplication
+        if model.checkingAppVersions || model.busy {
+            add(model.checkingAppVersions ? "Checking application versions…" : model.activity, action: nil)
+        } else if model.databaseUpdateAvailable {
+            add("Database update available", action: nil)
+        }
+        if model.updatingScanDatabase || model.scanningMac {
+            add(model.updatingScanDatabase ? "Stop database update" : "Stop system scan",
+                action: #selector(stop), enabled: !model.cancellingScan && model.scanProgress?.stage != "updated")
+        } else {
+            add("Update Database Now", action: #selector(update), enabled: !unavailable)
+            add("Check for Database Update", action: #selector(checkDatabase), enabled: !unavailable)
+            add("Scan This Mac", action: #selector(scan), enabled: !unavailable)
+        }
+        add("Check Application Versions", action: #selector(checkApps), enabled: !unavailable)
+        menu.addItem(.separator())
+        add("Launch at Login", action: #selector(toggleLogin))
+        menu.items.last?.state = model.launchAtLogin ? .on : .off
+        if model.loginStatus == .requiresApproval {
+            add("Approve in Login Items…", action: #selector(openLoginItems))
+        }
+        add("Settings…", action: #selector(settings))
+        add("Quit Ward", action: #selector(quit))
+    }
+
+    private func add(_ title: String, action: Selector?, enabled: Bool = true) {
+        let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        entry.target = self
+        entry.isEnabled = action != nil && enabled
+        menu.addItem(entry)
+    }
+
+    @objc private func update() { Task { await model?.localScan(update: true, updateOnly: true) } }
+    @objc private func checkDatabase() { Task { await model?.localScan(update: true, updateOnly: true, checkOnly: true) } }
+    @objc private func scan() { Task { await model?.localScan(update: false) } }
+    @objc private func checkApps() { Task { await model?.checkApplicationVersions() } }
+    @objc private func stop() { model?.cancelScan() }
+    @objc private func toggleLogin() {
+        guard let model else { return }
+        model.setLaunchAtLogin(!model.launchAtLogin)
+    }
+    @objc private func openLoginItems() { SMAppService.openSystemSettingsLoginItems() }
+
+    @objc private func settings() {
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        openSettings()
+    }
+    @objc private func quit() { model?.cancelScan(); NSApp.terminate(nil) }
+}
+
+private struct WardSettingsPage: View {
+    @ObservedObject var model: WardModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Settings").font(.largeTitle.weight(.semibold))
+                section("Menu bar", symbol: "menubar.rectangle") {
+                    Toggle("Show Ward in the menu bar", isOn: $model.preferences.menuBar)
+                    Text("Closing the last window hides Ward from the Dock. Scheduled checks keep running.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                section("Startup", symbol: "power") {
+                    Toggle("Launch Ward at login", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
+                    if model.loginStatus == .requiresApproval {
+                        Button("Approve in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
+                section("Signed database", symbol: "externaldrive.fill") {
+                    interval("Check for database updates", selection: $model.preferences.databaseMinutes)
+                    Toggle("Download available database updates automatically", isOn: $model.preferences.downloadDatabase)
+                        .disabled(model.preferences.databaseMinutes == 0)
+                    Text("Uses your selected Beacon. With automatic downloads off, Ward checks the signed manifest only.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if model.databaseUpdateAvailable {
+                        Label("Database update available", systemImage: "arrow.down.circle")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                section("System scan", symbol: "magnifyingglass") {
+                    interval("Scan this Mac using the local database", selection: $model.preferences.scanMinutes)
+                    Toggle("Scan once after installing a new database", isOn: $model.preferences.scanNewDatabase)
+                    Text("Scans run offline. The after-update scan starts only after a newer signed revision is installed, independently of the schedule.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if model.scanningMac {
+                        Label(model.activity, systemImage: "magnifyingglass").foregroundStyle(.secondary)
+                    } else if let last = model.devices.first(where: { $0.id == "local" })?.report.generated_at,
+                              let date = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(last))
+                                    ?? (try? Date.ISO8601FormatStyle().parse(last)) {
+                        LabeledContent("Last system scan", value: date.formatted(date: .abbreviated, time: .shortened))
+                    }
+                }
+                section("Application versions", symbol: "macwindow") {
+                    interval("Check installed applications for new versions", selection: $model.preferences.applicationMinutes)
+                    Text("Checks supported update channels while Ward is running.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(28)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .onAppear { model.refreshLoginStatus() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refreshLoginStatus()
+        }
+    }
+
+    private func interval(_ title: String, selection: Binding<Int>) -> some View {
+        Picker(title, selection: selection) {
+            Text("Manual only").tag(0)
+            Text("Every 15 minutes").tag(15)
+            Text("Every 30 minutes").tag(30)
+            Text("Every hour").tag(60)
+            Text("Every 6 hours").tag(360)
+            Text("Every day").tag(1440)
+        }
+        .pickerStyle(.menu)
+    }
+
+    private func section<Content: View>(_ title: String, symbol: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: symbol).font(.headline)
+            content()
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .wardGlass(radius: 16)
+    }
+}
+
 
 private struct MenuGlyph: View {
     let symbol: String
@@ -1220,7 +1616,10 @@ struct Dashboard: View {
                     model.devicePath = routed
                 }
             }
-            if let section = section(for: newValue), menuSection != section {
+            if newValue == "settings" {
+                menuDrill = false
+                menuSection = nil
+            } else if let section = section(for: newValue), menuSection != section {
                 menuDrill = true
                 menuSection = section
             }
@@ -1311,6 +1710,7 @@ struct Dashboard: View {
                             rootRow(.data, "Data", "externaldrive.fill", Color(red: 0.45, green: 0.70, blue: 0.78))
                             rootRow(.servers, "Servers", "server.rack", .mint)
                             rootRow(.beacons, "Beacons", "antenna.radiowaves.left.and.right", Color(red: 0.78, green: 0.48, blue: 0.72))
+                            menuRow("settings", "Settings", "gearshape.fill", Color(red: 0.62, green: 0.64, blue: 0.78))
                         }
                         .transition(menuSlide)
                     }
@@ -1411,6 +1811,8 @@ struct Dashboard: View {
                     beaconsPage
                 } else if model.selection == "beacon-profiles" {
                     beaconProfilesPage
+                } else if model.selection == "settings" {
+                    WardSettingsPage(model: model)
                 } else if model.selection == "database" {
                     databasePage
                 } else if let beacon = model.beacons.first(where: { "beacon:" + $0.id.uuidString == model.selection }) {
@@ -3385,6 +3787,102 @@ private struct SparkleZip {
     var length: Int?
 }
 
+private func appChannel(_ app: Report.Inventory.Application) -> AppUpdateChannel {
+    guard !app.identifier.isEmpty,
+          let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier) else {
+        return app.identifier.isEmpty ? .none : .missing
+    }
+    return ChannelMemo.shared.channel(for: bundle.path + "\t" + app.identifier) {
+        discoveredChannel(app, bundle: bundle)
+    }
+}
+
+private func discoveredChannel(_ app: Report.Inventory.Application, bundle: URL) -> AppUpdateChannel {
+    let plist = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))
+    let receipt = bundle.appendingPathComponent("Contents/_MASReceipt/receipt").path
+    if FileManager.default.fileExists(atPath: receipt), appStoreIdentifier(app.identifier) {
+        return .appStore(app.identifier)
+    }
+    if app.isApple { return .system }
+    if app.identifier == "com.docker.docker" {
+        let executable = bundle.appendingPathComponent("Contents/Resources/cli-plugins/docker-desktop")
+        return FileManager.default.isExecutableFile(atPath: executable.path) ? .dockerDesktop(executable) : .none
+    }
+    if let feed = declaredSparkleFeed(bundle, plist: plist) {
+        return .sparkle(feed)
+    }
+    if let url = electronFeed(bundle) {
+        return .electron(url)
+    }
+    if let vscode = vscodeChannel(bundle) {
+        return .vscode(vscode.0, vscode.1, vscode.2, vscode.3)
+    }
+    if let plain = plainVersionFeed(bundle) {
+        return .plain(plain)
+    }
+    if plist?["SUPublicEDKey"] != nil || plist?["SUPublicDSAKeyFile"] != nil {
+        return .sparkleUnlisted
+    }
+    return .none
+}
+
+private func declaredSparkleFeed(_ bundle: URL, plist: NSDictionary?) -> URL? {
+    if let feed = plist?["SUFeedURL"] as? String, let url = httpsUpdateURL(feed) {
+        return url
+    }
+    return embeddedSparkleFeed(bundle)
+}
+
+private func electronFeed(_ bundle: URL) -> URL? {
+    let file = bundle.appendingPathComponent("Contents/Resources/app-update.yml")
+    guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+    for raw in text.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard line.hasPrefix("url:") else { continue }
+        var value = String(line.dropFirst(4).trimmingCharacters(in: .whitespaces))
+        if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+            value = String(value.dropFirst().dropLast())
+        }
+        return httpsUpdateURL(String(value))
+    }
+    return nil
+}
+
+private func liveVersion(_ app: Report.Inventory.Application) -> String {
+    guard !app.identifier.isEmpty,
+          let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier),
+          let plist = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")),
+          let short = plist["CFBundleShortVersionString"] as? String else { return app.version }
+    let trimmed = short.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? app.version : trimmed
+}
+
+private func updateJobs(for applications: [Report.Inventory.Application]) -> [AppUpdateJob] {
+    applications.compactMap { app -> AppUpdateJob? in
+        guard !app.identifier.isEmpty else { return nil }
+        let installed = liveVersion(app)
+        guard !installed.isEmpty else { return nil }
+        switch appChannel(app) {
+        case .appStore(let id):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .appStore(id))
+        case .sparkle(let url):
+            let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier)
+            let hasKey = bundle.map(sparkleHasSigningKey) ?? false
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .sparkle(url, hasKey))
+        case .electron(let url):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .electron(url))
+        case .vscode(let base, let platform, let name, let quality):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .vscode(base, platform, name, quality))
+        case .plain(let url):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .plain(url))
+        case .dockerDesktop(let executable):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .dockerDesktop(executable))
+        case .sparkleUnlisted, .system, .none, .missing:
+            return nil
+        }
+    }
+}
+
 private struct AppUpdateJob: Sendable {
     enum Target: Sendable {
         case appStore(String)
@@ -3567,7 +4065,7 @@ private func appStoreIdentifier(_ identifier: String) -> Bool {
 
 // Apps the account has opened that live outside the folders the scan walks.
 // A preferences file is the evidence of a launch. Library, build trees and nested copies stay out.
-private func outsideApplications(known: Set<String>) -> [Report.Inventory.Application] {
+private func outsideApplications(known: Set<String>, includeStandardLocations: Bool = false) -> [Report.Inventory.Application] {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     guard let lines = spotlightApplications() else { return [] }
     var found: [Report.Inventory.Application] = []
@@ -3575,7 +4073,8 @@ private func outsideApplications(known: Set<String>) -> [Report.Inventory.Applic
     for raw in lines {
         guard let bundle = applicationBundleURL(raw) else { continue }
         let path = bundle.path
-        if seen.contains(path) || skippedOutsidePath(path, home: home) { continue }
+        let standard = path.hasPrefix("/Applications/") || path.hasPrefix(home + "/Applications/")
+        if seen.contains(path) || (skippedOutsidePath(path, home: home) && !(includeStandardLocations && standard)) { continue }
         seen.insert(path)
         guard let plist = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")),
               let identifier = plist["CFBundleIdentifier"] as? String,
@@ -3586,7 +4085,7 @@ private func outsideApplications(known: Set<String>) -> [Report.Inventory.Applic
             .appendingPathComponent("Library/Preferences")
             .appendingPathComponent(identifier + ".plist")
         var directory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: prefs.path, isDirectory: &directory), !directory.boolValue else { continue }
+        guard (includeStandardLocations && standard) || (FileManager.default.fileExists(atPath: prefs.path, isDirectory: &directory) && !directory.boolValue) else { continue }
         var name = ((plist["CFBundleName"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if name.isEmpty {
             name = ((plist["CFBundleDisplayName"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4279,13 +4778,16 @@ struct ReportView: View {
     private var appFilter: AppFilter { selectedAppFilter ?? (device.id == "local" ? .updates : .user) }
     @State private var extraApplications: [Report.Inventory.Application] = []
     @State private var appQuery = ""
-    @State private var updateChecks: [String: AppUpdateRecord] = [:]
-    @State private var checkingUpdates = false
-    @State private var updateNote = ""
+    private var updateChecks: [String: AppUpdateRecord] {
+        get { device.id == "local" ? model.appUpdateChecks : [:] }
+        nonmutating set { model.appUpdateChecks = newValue }
+    }
+    private var checkingUpdates: Bool { model.checkingAppVersions }
+    private var updateNote: String { model.applicationUpdateNote }
     @State private var appInstall: AppInstallRequest?
     @State private var installLog = ""
     @State private var installMessage = ""
-    @State private var installing = false
+    private var installing: Bool { model.installingApplication }
     @State private var packageFilter: PackageFilter = .all
     @State private var packageSource: String?
     @State private var packageQuery = ""
@@ -5228,167 +5730,28 @@ struct ReportView: View {
         return fallback
     }
 
-    private func appChannel(_ app: Report.Inventory.Application) -> AppUpdateChannel {
-        guard !app.identifier.isEmpty,
-              let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier) else {
-            return app.identifier.isEmpty ? .none : .missing
-        }
-        return ChannelMemo.shared.channel(for: bundle.path + "\t" + app.identifier) {
-            discoveredChannel(app, bundle: bundle)
-        }
-    }
-
-    private func discoveredChannel(_ app: Report.Inventory.Application, bundle: URL) -> AppUpdateChannel {
-        let plist = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))
-        let receipt = bundle.appendingPathComponent("Contents/_MASReceipt/receipt").path
-        if FileManager.default.fileExists(atPath: receipt), appStoreIdentifier(app.identifier) {
-            return .appStore(app.identifier)
-        }
-        if app.isApple { return .system }
-        if app.identifier == "com.docker.docker" {
-            let executable = bundle.appendingPathComponent("Contents/Resources/cli-plugins/docker-desktop")
-            return FileManager.default.isExecutableFile(atPath: executable.path) ? .dockerDesktop(executable) : .none
-        }
-        if let feed = declaredSparkleFeed(bundle, plist: plist) {
-            return .sparkle(feed)
-        }
-        if let url = electronFeed(bundle) {
-            return .electron(url)
-        }
-        if let vscode = vscodeChannel(bundle) {
-            return .vscode(vscode.0, vscode.1, vscode.2, vscode.3)
-        }
-        if let plain = plainVersionFeed(bundle) {
-            return .plain(plain)
-        }
-        if plist?["SUPublicEDKey"] != nil || plist?["SUPublicDSAKeyFile"] != nil {
-            return .sparkleUnlisted
-        }
-        return .none
-    }
-
-    private func declaredSparkleFeed(_ bundle: URL, plist: NSDictionary?) -> URL? {
-        if let feed = plist?["SUFeedURL"] as? String, let url = httpsUpdateURL(feed) {
-            return url
-        }
-        return embeddedSparkleFeed(bundle)
-    }
-
-    private func electronFeed(_ bundle: URL) -> URL? {
-        let file = bundle.appendingPathComponent("Contents/Resources/app-update.yml")
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
-        for raw in text.split(separator: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("url:") else { continue }
-            var value = String(line.dropFirst(4).trimmingCharacters(in: .whitespaces))
-            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
-                value = String(value.dropFirst().dropLast())
-            }
-            return httpsUpdateURL(String(value))
-        }
-        return nil
-    }
-
-    private func liveVersion(_ app: Report.Inventory.Application) -> String {
-        guard !app.identifier.isEmpty,
-              let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier),
-              let plist = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")),
-              let short = plist["CFBundleShortVersionString"] as? String else { return app.version }
-        let trimmed = short.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? app.version : trimmed
-    }
-
-    private func updateJobs() -> [AppUpdateJob] {
-        listedApplications.compactMap { app -> AppUpdateJob? in
-            guard !app.identifier.isEmpty else { return nil }
-            let installed = liveVersion(app)
-            guard !installed.isEmpty else { return nil }
-            switch appChannel(app) {
-            case .appStore(let id):
-                return AppUpdateJob(id: app.identifier, installed: installed, target: .appStore(id))
-            case .sparkle(let url):
-                let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier)
-                let hasKey = bundle.map(sparkleHasSigningKey) ?? false
-                return AppUpdateJob(id: app.identifier, installed: installed, target: .sparkle(url, hasKey))
-            case .electron(let url):
-                return AppUpdateJob(id: app.identifier, installed: installed, target: .electron(url))
-            case .vscode(let base, let platform, let name, let quality):
-                return AppUpdateJob(id: app.identifier, installed: installed, target: .vscode(base, platform, name, quality))
-            case .plain(let url):
-                return AppUpdateJob(id: app.identifier, installed: installed, target: .plain(url))
-            case .dockerDesktop(let executable):
-                return AppUpdateJob(id: app.identifier, installed: installed, target: .dockerDesktop(executable))
-            case .sparkleUnlisted, .system, .none, .missing:
-                return nil
-            }
-        }
-    }
-
     private func refreshApplicationUpdatesIfNeeded() {
         guard !checkingUpdates, !installing else { return }
-        if let cache = AppUpdateStore.load() {
-            updateChecks = cache.results
-            model.updateAppBadge(updateChecks, for: Set(listedApplications.map(\.identifier)))
-            let jobs = updateJobs()
-            let versionsMatch = jobs.allSatisfy { updateChecks[$0.id]?.installed == $0.installed }
-            if Date().timeIntervalSince(cache.date) < AppUpdateStore.ttl, versionsMatch {
-                updateNote = "Showing results from the last hour."
-                return
-            }
-        }
+        let jobs = updateJobs(for: listedApplications)
+        if let cache = AppUpdateStore.load(),
+           Date().timeIntervalSince(cache.date) < AppUpdateStore.ttl,
+           jobs.allSatisfy({ cache.results[$0.id]?.installed == $0.installed }) { return }
         checkNewerVersions()
     }
 
     private func checkNewerVersions(showProgress: Bool = false) {
-        guard device.id == "local", !checkingUpdates, !installing else { return }
-        let jobs = updateJobs()
-        guard !jobs.isEmpty else {
-            updateNote = "None of the listed apps declare an update channel Ward can read."
-            return
-        }
-        let earliestReturn = ContinuousClock.now + .milliseconds(900)
-        if showProgress { model.applicationCheckProgress = (0, jobs.count) }
-        checkingUpdates = true
-        updateNote = "Checking \(jobs.count.formatted()) apps that declare a channel."
-        for job in jobs {
-            updateChecks[job.id] = AppUpdateRecord(text: "Checking…", newer: false, canInstall: false, reported: "", installed: job.installed)
-        }
-        Task {
-            let results = await withTaskGroup(of: (String, AppUpdateRecord).self) { group in
-                for job in jobs {
-                    group.addTask { (job.id, await job.lookup()) }
-                }
-                var found: [String: AppUpdateRecord] = [:]
-                var completed = 0
-                for await (id, record) in group {
-                    found[id] = record
-                    completed += 1
-                    if showProgress { model.applicationCheckProgress = (completed, jobs.count) }
-                }
-                return found
-            }
-            updateChecks.merge(results) { _, new in new }
-            AppUpdateStore.save(updateChecks)
-            model.updateAppBadge(updateChecks, for: Set(listedApplications.map(\.identifier)))
-            if showProgress {
-                try? await ContinuousClock().sleep(until: earliestReturn)
-                model.applicationCheckProgress = nil
-            }
-            checkingUpdates = false
-            let available = results.values.filter(\.newer).count
-            updateNote = available == 0
-                ? "Checked \(jobs.count.formatted()) declared channels."
-                : "Checked \(jobs.count.formatted()) declared channels. \(available.formatted()) have a newer version."
-        }
+        guard device.id == "local" else { return }
+        let apps = listedApplications
+        Task { await model.checkApplicationVersions(apps, showProgress: showProgress) }
     }
 
     private func runAppUpdate(_ request: AppInstallRequest) {
-        guard !installing else { return }
-        installing = true
+        guard !installing, !checkingUpdates, !model.busy else { return }
+        model.installingApplication = true
         installMessage = ""
         installLog = ""
         Task {
-            defer { installing = false }
+            defer { model.installingApplication = false }
             do {
                 let reopenURL: URL?
                 switch request.kind {
