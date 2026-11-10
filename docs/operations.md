@@ -24,7 +24,7 @@ trust bootstrap, separate publisher/HTTPS accounts and installation services.
 - lookup: local bounded advisory/package/risk query, not a host verdict.
 - collect: minimal OS/kernel snapshot (diagnostic prototype; use scan for full data).
 - run: initial update then full report, independent periodic report/update loops;
-  defaults are 15-minute reports and six-hour updates, installer uses hourly reports.
+  defaults are 15-minute reports and one-minute manifest polling; the installer uses hourly reports.
   A failed pass logs an error and the process continues. Logs stay in home, bounded.
 - migrate-home: explicitly copy legacy settings/state/checkpoint into home defaults;
   original files remain as backup. It does not bypass signature/expiry/rollback.
@@ -61,5 +61,11 @@ An expired DB cannot be used for a new successful scan. Fix synchronization/cloc
 and run update; do not remove checkpoints or disable verification.
 
 Resident retries failed database synchronization within one minute (or the shorter
-configured interval); a successful background update requests an immediate new
+configured interval); changed database objects request an immediate new
 report. Scans remain serialized, so downloads never create concurrent report writers.
+
+Manifest polling uses If-None-Match with an ETag derived from the signed envelope.
+Unchanged publications return 304 without a body; older mirrors can return the
+manifest normally. Only missing/changed content-addressed objects are downloaded.
+A signature renewal without changed objects updates freshness but does not trigger
+a scan. Scheduled scans remain independent.

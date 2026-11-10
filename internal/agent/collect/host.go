@@ -26,8 +26,9 @@ const osReleaseLimit = 1 << 20
 type Command func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 type Host struct {
-	OSReleasePaths []string
-	Command        Command
+	DockerSnapshotPath string
+	OSReleasePaths     []string
+	Command            Command
 }
 
 var notChecked = []struct{ source, detail string }{
@@ -120,6 +121,9 @@ func (h Host) readRelease(snap *inventory.Snapshot) error {
 			return nil
 		}
 		snap.Host.Release = parseRelease(string(body), releaseKeys)
+		if codename := inventory.UbuntuCodename(snap.Host.Release); codename != "" {
+			snap.Host.Release["VERSION_CODENAME"] = codename
+		}
 		return nil
 	}
 	if last != nil {

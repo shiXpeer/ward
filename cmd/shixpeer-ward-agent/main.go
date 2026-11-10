@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"shixpeer.com/ward/internal/agent/agent"
 	"shixpeer.com/ward/internal/agent/collect"
 	"shixpeer.com/ward/internal/agent/database"
+	"shixpeer.com/ward/internal/agent/scan"
 	"shixpeer.com/ward/internal/agent/state"
 	"shixpeer.com/ward/internal/compactdb"
 	"shixpeer.com/ward/internal/identity"
@@ -37,6 +39,17 @@ func run(args []string) error {
 	if len(args) == 0 {
 		args = []string{"update"}
 	}
+	if args[0] == "capture-docker" {
+		if len(args) != 1 {
+			return errors.New("capture-docker takes no arguments")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		return (collect.Host{}).CaptureDocker(ctx, os.Stdout)
+	}
+	if args[0] == "probe" {
+		return probeTCP(args[1:])
+	}
 	if args[0] == "migrate-home" {
 		return migrateHome(args[1:])
 	}
@@ -45,7 +58,7 @@ func run(args []string) error {
 		return nil
 	}
 	if args[0] == "help" || args[0] == "--help" {
-		fmt.Println("Shixpeer Ward — https://shixpeer.com\nCommands: setup (save download settings), update (signed database, changed objects only; default), pull (alias), scan (offline system report), collect (offline), lookup (offline), run (resident update + scan), migrate-home (copy legacy state into home).\nUse COMMAND -h for options. No software updates or remote commands.")
+		fmt.Println("Shixpeer Ward — https://shixpeer.com\nCommands: setup (save download settings), update (signed database, changed objects only; default), pull (alias), scan (offline system report), collect (offline), lookup (offline), probe (explicit TCP check), run (resident update + scan), migrate-home (copy legacy state into home).\nUse COMMAND -h for options. No software updates or remote commands.")
 		return nil
 	}
 	cmd := args[0]
@@ -62,6 +75,10 @@ func run(args []string) error {
 	keyfile := fs.String("trusted-key", "", "trusted feed.pub, provisioned out of band")
 	cafile := fs.String("ca-file", "", "private Beacon CA certificate; omit for public/GitHub HTTPS")
 	allow := fs.String("allow-hosts", "", "additional HTTPS redirect/artifact hostnames, comma-separated")
+	progressJSON := fs.Bool("progress-json", false, "emit scan or update progress as JSON lines on stderr")
+	formula := fs.String("verify-formula", "", "scan only one installed Homebrew formula and emit JSON")
+	verifyIDs := fs.String("verify-advisories", "", "comma-separated advisory IDs for formula verification")
+	brewPrefix := fs.String("brew-prefix", "/opt/homebrew", "Homebrew prefix for targeted verification")
 	reportDir := fs.String("report-dir", "", "scan report directory; default state directory")
 	group := fs.String("group", "p", "lookup: p (package), v (advisory), r (risk)")
 	ecosystem := fs.String("ecosystem", "", "lookup package ecosystem, e.g. Debian:bookworm")
@@ -69,7 +86,8 @@ func run(args []string) error {
 	id := fs.String("id", "", "lookup advisory/CVE identifier")
 	limit := fs.Int("limit", 100, "maximum local lookup rows, 1..10000")
 	collectEvery := fs.Duration("collect-interval", 15*time.Minute, "scan/report interval")
-	feedEvery := fs.Duration("feed-interval", 6*time.Hour, "snapshot interval")
+	feedEvery := fs.Duration("feed-interval", time.Minute, "signed manifest poll interval")
+	upload := fs.String("report-upload-config", "", "opt-in encrypted relay configuration for scan and run")
 	if e := fs.Parse(args[1:]); e != nil {
 		return e
 	}
@@ -113,7 +131,39 @@ func run(args []string) error {
 	defer stop()
 
 	if cmd == "scan" {
-		return runScan(ctx, *dir, *reportDir, pub, (collect.Host{}).SoftwareSnapshot)
+		if *formula != "" {
+			snapshot, err := collect.HomebrewFormulaSnapshot(*brewPrefix, *formula)
+			if err != nil {
+				return err
+			}
+			report := scan.New(snapshot)
+			db, err := database.OpenReader(ctx, filepath.Join(*dir, "database"), pub)
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			ids := make(map[string]bool)
+			for _, id := range strings.Split(*verifyIDs, ",") {
+				if id != "" {
+					ids[id] = true
+				}
+			}
+			if err = scan.RunForAdvisories(ctx, &report, db, ids); err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(report)
+		}
+		collectSnapshot := (collect.Host{DockerSnapshotPath: filepath.Join(*dir, collect.DockerSnapshotFile)}).SoftwareSnapshot
+		var err error
+		if *progressJSON {
+			err = runScanWithProgress(ctx, *dir, *reportDir, pub, collectSnapshot, os.Stdout, io.Discard, json.NewEncoder(os.Stderr))
+		} else {
+			err = runScan(ctx, *dir, *reportDir, pub, collectSnapshot)
+		}
+		if err != nil {
+			return err
+		}
+		return sendReport(ctx, *upload, *dir, *reportDir)
 	}
 	if cmd == "collect" {
 		snap, e := (collect.Host{}).Snapshot(ctx)
@@ -157,15 +207,15 @@ func run(args []string) error {
 		if feeds == nil {
 			return errors.New("no download source configured: run setup -feed-url HTTPS_URL -trusted-key feed.pub once")
 		}
+		if *progressJSON {
+			encoder := json.NewEncoder(os.Stderr)
+			feeds.OnProgress = func(p database.Progress) { _ = encoder.Encode(p) }
+		}
 		result, e := feeds.Update(ctx)
 		if e != nil {
 			return e
 		}
 		return json.NewEncoder(os.Stdout).Encode(result)
-	}
-	var update func(context.Context) error
-	if feeds != nil {
-		update = feeds.Refresh
 	}
 	logs, err := agent.OpenLog(filepath.Join(paths.Root(), "logs", "agent.log"), 4<<20)
 	if err != nil {
@@ -173,8 +223,30 @@ func run(args []string) error {
 	}
 	defer logs.Close()
 	logger := log.New(logs, "", log.LstdFlags)
+	var update func(context.Context) (bool, error)
+	if feeds != nil {
+		first := true
+		update = func(ctx context.Context) (bool, error) {
+			poll := feeds.Poll
+			if first {
+				poll = feeds.Update
+				first = false
+			}
+			r, err := poll(ctx)
+			if err == nil && r.Changed {
+				logger.Printf("database: revision=%d downloaded=%d bytes=%d", r.Revision, r.Downloaded, r.WireBytes)
+			}
+			return r.Changed, err
+		}
+	}
 	fmt.Println("Resident update + scan started; bounded logs:", filepath.Join(paths.Root(), "logs", "agent.log"))
 	return agent.Resident(ctx, update, func(ctx context.Context) error {
-		return runScanTo(ctx, *dir, *reportDir, pub, (collect.Host{}).SoftwareSnapshot, logs, logs)
+		if err := runScanTo(ctx, *dir, *reportDir, pub, (collect.Host{DockerSnapshotPath: filepath.Join(*dir, collect.DockerSnapshotFile)}).SoftwareSnapshot, logs, logs); err != nil {
+			return err
+		}
+		if err := sendReport(ctx, *upload, *dir, *reportDir); err != nil {
+			logger.Printf("report upload: %v", err)
+		}
+		return nil
 	}, *feedEvery, *collectEvery, logger)
 }

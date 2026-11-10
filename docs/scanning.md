@@ -121,7 +121,7 @@ Limits: 50,000 package entries, 3,000 app bundles, 10,000 services/sockets/globa
 packages, 1,000 running containers; 16 MiB dpkg, 4 MiB other large probe output,
 1 MiB plist/receipt output; 30 seconds per probe and two minutes total command time.
 Matching streams up to 100,000 rules per component without retaining them all;
-there are at most 10,000 aggregated findings. Public lookup CLI retains its
+output retains up to 64 findings per component and 10,000 overall. Counts include omitted details; output limits do not stop component checks. Public lookup CLI retains its
 10,000-row bound. The complete DB is never loaded.
 
 JSON contains all bounded inventory/findings; Markdown shows up to 100 findings
@@ -159,3 +159,18 @@ References: [NVD applicability data](https://nvd.nist.gov/developers/vulnerabili
 Running Ubuntu kernels are resolved using /proc/version_signature and dpkg/Built-Using;
 Debian uses its uname -v build signature. Installed and loaded source versions remain
 separate. A pending reboot is warned, never performed.
+
+Beacon includes a versioned `product_policy` in the signed manifest. It contains
+exact Homebrew core formula and application bundle identifiers, plus scoped CVE
+exclusions for known patched builds and fixed upstream releases. A legacy feed
+without this policy leaves these identities unchecked and reports the gap in
+Coverage. Docker Desktop on macOS is an exception for older signed databases
+that explicitly declare `nvd-cpe-docker-desktop-v1`. Ward can use that existing
+coverage for the `com.docker.docker` release version. A published product policy,
+when present, remains authoritative. Other inventory ecosystems use their own
+matching rules.
+
+The publisher defaults are in `internal/productid/defaults.json`. To publish
+a modified catalog, pass `-product-policy PATH` to Beacon `sync` or `run`.
+Refresh the NVD sources together when changing the policy, then export and
+update the agent database. The agent binary can stay in place.

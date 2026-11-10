@@ -94,3 +94,17 @@ func TestGlobalLanguageRules(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalUnfixedAmbiguityAndPublicFix(t *testing.T) {
+	r := compactdb.Row{ID: "UBUNTU-CVE-2026-1234", Ecosystem: "Ubuntu:22.04:LTS", Context: json.RawMessage(`{"availability":"No subscription required"}`), Ranges: []vuln.Range{{Type: "ECOSYSTEM", Events: []vuln.RangeEvent{{Introduced: "0"}}}}}
+	if d := evaluate(r, "1.0", true); d.state != "review" {
+		t.Fatal(d)
+	}
+	r.Ranges[0].Events = append(r.Ranges[0].Events, vuln.RangeEvent{Fixed: "2.0"})
+	if d := evaluate(r, "1.0", false); d.state != "affected" || len(d.fixed) != 1 {
+		t.Fatal(d)
+	}
+	if d := evaluate(r, "2.0", false); d.state != "excluded" {
+		t.Fatal(d)
+	}
+}

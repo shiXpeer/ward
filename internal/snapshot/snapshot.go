@@ -30,16 +30,17 @@ type Object struct {
 func (o Object) Name() string { return "db-" + o.SHA256 + ".wdb" }
 
 type Manifest struct {
-	Version    int                      `json:"version"`
-	Format     int                      `json:"format"`
-	Revision   int64                    `json:"revision"`
-	CreatedAt  time.Time                `json:"created_at"`
-	ExpiresAt  time.Time                `json:"expires_at"`
-	BaseURL    string                   `json:"base_url,omitempty"`
-	Profile    compactdb.Profile        `json:"profile"`
-	Generation string                   `json:"generation"`
-	Sources    []compactdb.SourceStatus `json:"sources"`
-	Objects    []Object                 `json:"objects"`
+	ProductPolicy *ProductPolicy           `json:"product_policy,omitempty"`
+	Version       int                      `json:"version"`
+	Format        int                      `json:"format"`
+	Revision      int64                    `json:"revision"`
+	CreatedAt     time.Time                `json:"created_at"`
+	ExpiresAt     time.Time                `json:"expires_at"`
+	BaseURL       string                   `json:"base_url,omitempty"`
+	Profile       compactdb.Profile        `json:"profile"`
+	Generation    string                   `json:"generation"`
+	Sources       []compactdb.SourceStatus `json:"sources"`
+	Objects       []Object                 `json:"objects"`
 }
 type Envelope struct {
 	Payload   []byte `json:"payload"`
@@ -72,6 +73,9 @@ func Verify(b []byte, key ed25519.PublicKey, now time.Time) (Manifest, error) {
 	if m.Version != Version || m.Format != compactdb.Format || m.Revision < 1 || m.CreatedAt.IsZero() || m.CreatedAt.After(now.Add(5*time.Minute)) || !m.ExpiresAt.After(now) || !m.ExpiresAt.After(m.CreatedAt) || m.ExpiresAt.Sub(m.CreatedAt) > 7*24*time.Hour || !digestPattern.MatchString(m.Generation) {
 		return m, errors.New("unsupported, expired or invalid snapshot")
 	}
+	if e := m.ProductPolicy.Validate(); e != nil {
+		return m, e
+	}
 	if e := m.Profile.Validate(); e != nil {
 		return m, e
 	}
@@ -101,3 +105,7 @@ func PayloadDigest(raw []byte) string {
 	}
 	return Digest(e.Payload)
 }
+
+// ManifestETag identifies exact signed envelope bytes; it is a cache validator,
+// not a replacement for signature, expiry or rollback verification.
+func ManifestETag(raw []byte) string { return `"` + Digest(raw) + `"` }

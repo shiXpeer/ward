@@ -6,7 +6,7 @@ Wants=network-online.target
 Type=simple
 User=shixpeer-ward-agent
 Environment=HOME=/home/shixpeer-ward-agent
-ExecStart=/home/shixpeer-ward-agent/.shixpeer.ward/bin/shixpeer-ward-agent run -feed-interval 6h -collect-interval 1h
+ExecStart=/home/shixpeer-ward-agent/.shixpeer.ward/bin/shixpeer-ward-agent run -feed-interval 1m -collect-interval 1h
 WorkingDirectory=/home/shixpeer-ward-agent
 UMask=0077
 Restart=on-failure

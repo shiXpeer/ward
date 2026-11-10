@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,12 +15,18 @@ import (
 	"shixpeer.com/ward/internal/agent/database"
 	"shixpeer.com/ward/internal/atomicfile"
 	"shixpeer.com/ward/internal/compactdb"
+	"shixpeer.com/ward/internal/productid"
 	"shixpeer.com/ward/internal/snapshot"
 	"shixpeer.com/ward/pkg/inventory"
 	"shixpeer.com/ward/pkg/vuln"
 )
 
-func fixture(t *testing.T, expired bool) (string, ed25519.PublicKey) {
+func fixture(t *testing.T, expired bool, extra ...compactdb.Row) (string, ed25519.PublicKey) {
+	t.Helper()
+	return fixtureWithCoverage(t, expired, true, "nvd-cpe-v1", extra...)
+}
+
+func fixtureWithCoverage(t *testing.T, expired, includePolicy bool, format string, extra ...compactdb.Row) (string, ed25519.PublicKey) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -43,6 +50,9 @@ func fixture(t *testing.T, expired bool) (string, ed25519.PublicKey) {
 	put("p", compactdb.PackageKey("CPE", "a:haxx:curl"), compactdb.Row{Source: "fixture-nvd", ID: "CVE-CURL-FIXTURE", Ecosystem: "CPE", Package: "a:haxx:curl", Context: json.RawMessage(`{"cpe":{"match":{"vulnerable":true,"criteria":"cpe:2.3:a:haxx:curl:*:*:*:*:*:*:*:*","versionEndExcluding":"8.0.1"},"complex":false}}`)})
 	put("p", compactdb.PackageKey("CPE", "a:haxx:curl"), compactdb.Row{Source: "fixture-nvd", ID: "CVE-CURL-FIXTURE", Ecosystem: "CPE", Package: "a:haxx:curl", Review: true, Context: json.RawMessage(`{"cpe":{"match":{"vulnerable":true,"criteria":"cpe:2.3:a:haxx:curl:*:*:*:*:*:*:*:*","versionEndExcluding":"8.0.1"},"complex":true}}`)})
 	put("v", "CVE-CURL-FIXTURE", compactdb.Row{Source: "fixture-nvd", ID: "CVE-CURL-FIXTURE", Severity: "HIGH"})
+	for _, r := range extra {
+		put("p", compactdb.PackageKey(r.Ecosystem, r.Package), r)
+	}
 	bs, e := b.Finish(ctx, filepath.Join(dir, "compiled"))
 	if e != nil {
 		t.Fatal(e)
@@ -52,7 +62,14 @@ func fixture(t *testing.T, expired bool) (string, ed25519.PublicKey) {
 	if expired {
 		now = now.Add(-2 * time.Hour)
 	}
-	m := snapshot.Manifest{Version: snapshot.Version, Format: compactdb.Format, Revision: now.UnixNano(), CreatedAt: now, ExpiresAt: now.Add(time.Hour), Profile: compactdb.All, Generation: snapshot.Digest([]byte("test")), Sources: []compactdb.SourceStatus{{ID: "fixture", CheckedAt: now, RuleFormats: []string{"nvd-cpe-v1"}}}}
+	m := snapshot.Manifest{ProductPolicy: &snapshot.ProductPolicy{Version: 1,
+		Bundle:  map[string]string{"com.docker.docker": productid.Policy.Bundle["com.docker.docker"]},
+		Formula: map[string]string{"curl": "a:haxx:curl", "fixture-new-formula": "a:haxx:curl"},
+		Exclusions: []snapshot.ProductExclusion{{Product: "a:haxx:curl", CVEs: []string{"CVE-2026-12345"},
+			Formula: "fixture-new-formula", Installed: "8.0_2", Upstream: "8.0"}}}, Version: snapshot.Version, Format: compactdb.Format, Revision: now.UnixNano(), CreatedAt: now, ExpiresAt: now.Add(time.Hour), Profile: compactdb.All, Generation: snapshot.Digest([]byte("test")), Sources: []compactdb.SourceStatus{{ID: "fixture", CheckedAt: now, RuleFormats: []string{format}}}}
+	if !includePolicy {
+		m.ProductPolicy = nil
+	}
 	for _, bucket := range bs {
 		raw, e := os.ReadFile(bucket.Path)
 		if e != nil {
@@ -77,6 +94,30 @@ func fixture(t *testing.T, expired bool) (string, ed25519.PublicKey) {
 	}
 	return dir, pub
 }
+func TestMacOSCoverageRequiresMatchingBranch(t *testing.T) {
+	dir, key := fixture(t, false)
+	db, err := database.OpenReader(context.Background(), dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, tc := range []struct{ version, result string }{
+		{"27.3", "NOT_CHECKED"},
+		{"15.3", "NO_MATCH_IN_AVAILABLE_RULES"},
+		{"15.2", "REQUIRES_REVIEW"},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			r := New(inventory.Snapshot{Host: inventory.Host{Release: map[string]string{"ProductVersion": tc.version}}})
+			if err := Run(context.Background(), &r, db); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Components[0]; got.Result != tc.result {
+				t.Fatalf("macOS %s: got %+v, want %s", tc.version, got, tc.result)
+			}
+		})
+	}
+}
+
 func TestOfflineReportSourceVersionRiskAndMacReview(t *testing.T) {
 	dir, key := fixture(t, false)
 	db, e := database.OpenReader(context.Background(), dir, key)
@@ -177,12 +218,121 @@ func TestOfflineCoreCPEProofAndDuplicateRuleAggregation(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close()
-	s := inventory.Snapshot{Host: inventory.Host{Release: map[string]string{"ProductVersion": "26.5"}, Architecture: "arm64"}, Packages: []inventory.Package{{Manager: "homebrew-formula", Name: "curl", Version: "8.0_1", Provenance: "homebrew/core", UpstreamVersion: "8.0"}}}
+	s := inventory.Snapshot{Host: inventory.Host{Release: map[string]string{"ProductVersion": "26.5"}, Architecture: "arm64"}, Packages: []inventory.Package{{Manager: "homebrew-formula", Name: "fixture-new-formula", Version: "8.0_1", Provenance: "homebrew/core", UpstreamVersion: "8.0"}}}
 	r := New(s)
 	if e = Run(context.Background(), &r, db); e != nil {
 		t.Fatal(e)
 	}
-	if r.Confirmed != 1 || r.Review != 0 || len(r.Findings) != 1 || r.Findings[0].RuleMatches != 2 || r.Findings[0].MatchVersion != "8.0" || r.Findings[0].Evidence.Review {
+	if r.Confirmed != 1 || r.Review != 0 || len(r.Findings) != 1 || r.Findings[0].Component != "fixture-new-formula" || r.Findings[0].RuleMatches != 2 || r.Findings[0].MatchVersion != "8.0" || r.Findings[0].Evidence.Review {
 		t.Fatalf("%+v", r)
+	}
+}
+
+func TestKernelOutputFloodDoesNotPreventLaterPackageCheck(t *testing.T) {
+	rows := make([]compactdb.Row, 10025)
+	for i := range rows {
+		rows[i] = compactdb.Row{Source: "fixture", ID: fmt.Sprintf("KERNEL-%05d", i), Ecosystem: "Debian:bookworm", Package: "linux", Review: true}
+	}
+	dir, key := fixture(t, false, rows...)
+	db, e := database.OpenReader(context.Background(), dir, key)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer db.Close()
+	r := New(inventory.Snapshot{Host: inventory.Host{Release: map[string]string{"ID": "debian", "VERSION_CODENAME": "bookworm"}}, RunningKernel: &inventory.Kernel{Status: "IDENTIFIED", SourceName: "linux", SourceVersion: "1.0"}, Packages: []inventory.Package{{Manager: "dpkg", Name: "openssl", Version: "1:3.0.14-1~deb12u1"}}})
+	if e = Run(context.Background(), &r, db); e != nil {
+		t.Fatal(e)
+	}
+	if r.Confirmed != 1 || r.Review != len(rows) || len(r.Findings) != maxComponentFindings+1 || r.OmittedFindings != len(rows)-maxComponentFindings || r.Components[1].Result != "AFFECTED" || r.Findings[0].Component != "openssl" {
+		t.Fatalf("confirmed=%d review=%d retained=%d omitted=%d components=%+v", r.Confirmed, r.Review, len(r.Findings), r.OmittedFindings, r.Components)
+	}
+}
+
+func TestSignedPolicyPatchOnlyAppliesToMatchingRevision(t *testing.T) {
+	dir, key := fixture(t, false, compactdb.Row{Source: "nvd", ID: "CVE-2026-12345", Ecosystem: "CPE", Package: "a:haxx:curl",
+		Context: json.RawMessage(`{"cpe":{"match":{"vulnerable":true,"criteria":"cpe:2.3:a:haxx:curl:8.0:*:*:*:*:*:*:*"}}}`)})
+	db, err := database.OpenReader(context.Background(), dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := inventory.Snapshot{Packages: []inventory.Package{
+		{Manager: "homebrew-formula", Name: "fixture-new-formula", Version: "8.0_1", Provenance: "homebrew/core", UpstreamVersion: "8.0"},
+		{Manager: "homebrew-formula", Name: "fixture-new-formula", Version: "8.0_2", Provenance: "homebrew/core", UpstreamVersion: "8.0"},
+	}}
+	r := New(s)
+	if err := RunForAdvisories(context.Background(), &r, db, map[string]bool{"CVE-2026-12345": true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Findings) != 1 || r.Findings[0].Version != "8.0_1" {
+		t.Fatalf("unexpected findings: %+v", r.Findings)
+	}
+}
+
+func TestDockerDesktopUsesSignedProductPolicyAndMacApplicability(t *testing.T) {
+	const product = productid.DockerDesktop
+	if productid.Policy.Bundle["com.docker.docker"] != product || !productid.Known(product) {
+		t.Fatal("publisher does not index Docker Desktop")
+	}
+	rule := func(id, platform, fixed string) compactdb.Row {
+		return compactdb.Row{Source: "fixture-nvd", ID: id, Ecosystem: "CPE", Package: product,
+			Context: json.RawMessage(fmt.Sprintf(`{"cpe":{"match":{"vulnerable":true,"criteria":"cpe:2.3:a:docker:docker_desktop:*:*:*:*:*:%s:*:*","versionEndExcluding":%q}}}`, platform, fixed))}
+	}
+	dir, key := fixture(t, false,
+		rule("DOCKER-FIXED", "macos", "4.98.0"),
+		rule("DOCKER-WINDOWS", "windows", "4.99.0"),
+		rule("DOCKER-MAC", "macos", "4.99.0"))
+	db, err := database.OpenReader(context.Background(), dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := New(inventory.Snapshot{
+		Host: inventory.Host{Release: map[string]string{"ProductVersion": "26.5"}, Architecture: "arm64"},
+		Applications: []inventory.Application{
+			{Name: "Docker", Identifier: "com.docker.docker", Version: "4.98.0", VersionKind: "release"},
+		},
+	})
+	if err := Run(context.Background(), &r, db); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Findings) != 1 || r.Findings[0].ID != "DOCKER-MAC" || r.Confirmed != 1 {
+		t.Fatalf("expected only macOS rule covering the installed version: %+v", r.Findings)
+	}
+}
+
+func TestDockerDesktopLegacyCoverageRequiresSignedProductMarker(t *testing.T) {
+	for _, tc := range []struct{ format, want string }{
+		{productid.DockerDesktopRuleFormat, "AFFECTED"},
+		{"nvd-cpe-v1", "NOT_CHECKED"},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			row := compactdb.Row{Source: "fixture-nvd", ID: "DOCKER-LEGACY", Ecosystem: "CPE",
+				Package: productid.DockerDesktop, Context: json.RawMessage(`{"cpe":{"match":{"vulnerable":true,"criteria":"cpe:2.3:a:docker:docker_desktop:*:*:*:*:*:macos:*:*","versionEndExcluding":"4.99.0"}}}`)}
+			dir, key := fixtureWithCoverage(t, false, false, tc.format, row)
+			db, err := database.OpenReader(context.Background(), dir, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			report := New(inventory.Snapshot{
+				Host: inventory.Host{Release: map[string]string{"ProductVersion": "26.5"}, Architecture: "arm64"},
+				Applications: []inventory.Application{
+					{Name: "Docker", Identifier: "com.docker.docker", Version: "4.98.0", VersionKind: "release"},
+				},
+			})
+			if err := Run(context.Background(), &report, db); err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range report.Components {
+				if c.Origin == "application-bundle" {
+					if c.Result != tc.want {
+						t.Fatalf("Docker result = %s, want %s", c.Result, tc.want)
+					}
+					return
+				}
+			}
+			t.Fatal("Docker Desktop was not inventoried")
+		})
 	}
 }

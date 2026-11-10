@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"shixpeer.com/ward/internal/netpolicy"
 	"shixpeer.com/ward/pkg/vuln"
+	"slices"
 	"strings"
 	"time"
 )
@@ -33,7 +34,9 @@ type Config struct {
 	Sources []Definition `json:"sources"`
 }
 
-func Load(path string) ([]Source, error) {
+func Load(path string) ([]Source, error) { return LoadWithDefaultVEX(path, false) }
+
+func LoadWithDefaultVEX(path string, migrate bool) ([]Source, error) {
 	f, e := os.Open(path)
 	if e != nil {
 		return nil, e
@@ -56,6 +59,35 @@ func Load(path string) ([]Source, error) {
 	if err := dec.Decode(&trailing); err != io.EOF {
 		return nil, errors.New("source config must contain one JSON document")
 	}
+	if migrate {
+		hasVEX, canonical := false, false
+		for _, d := range cfg.Sources {
+			hasVEX = hasVEX || d.ID == "ubuntu-vex" || d.Type == VEXKind
+			canonical = canonical || (d.Enabled && d.ID == "canonical-osv" && d.Type == "osv-tar-xz" && d.URL == "https://security-metadata.canonical.com/osv/osv-all.tar.xz")
+		}
+		if canonical && !hasVEX {
+			cfg.Sources = append(cfg.Sources, Definition{ID: "ubuntu-vex", Type: VEXKind, URL: "https://security-metadata.canonical.com/vex/vex-all.tar.xz", Enabled: true, MaxBytes: 128 << 20})
+		}
+	}
+	if migrate {
+		canonical, hasOVAL := false, false
+		for _, d := range cfg.Sources {
+			canonical = canonical || (d.Enabled && d.ID == "canonical-osv" && d.Type == "osv-tar-xz" && d.URL == "https://security-metadata.canonical.com/osv/osv-all.tar.xz")
+			hasOVAL = hasOVAL || d.ID == "ubuntu-oval-jammy" || d.Type == JammyOVALKind
+		}
+		if canonical && !hasOVAL {
+			cfg.Sources = append(cfg.Sources, Definition{ID: "ubuntu-oval-jammy", Type: JammyOVALKind, URL: "https://security-metadata.canonical.com/oval/com.ubuntu.jammy.cve.oval.xml.bz2", Enabled: true, MaxBytes: 32 << 20})
+		}
+	}
+	if migrate {
+		for i := range cfg.Sources {
+			d := &cfg.Sources[i]
+			if d.ID == "canonical-osv" && d.Type == "osv-tar-xz" && d.URL == "https://security-metadata.canonical.com/osv/osv-all.tar.xz" &&
+				slices.Equal(d.RecordKinds, []string{"cve", "lsn"}) {
+				d.RecordKinds = append(d.RecordKinds, "usn")
+			}
+		}
+	}
 	var sources []Source
 	seen := map[string]bool{}
 	for _, d := range cfg.Sources {
@@ -66,7 +98,7 @@ func Load(path string) ([]Source, error) {
 			return nil, errors.New("source IDs must be nonempty and unique")
 		}
 		seen[d.ID] = true
-		if d.Type != "osv" && d.Type != "osv-zip" && d.Type != "cisa-kev" && d.Type != "osv-tar-xz" && d.Type != "debian-tracker" && d.Type != "sofa" && d.Type != "epss-gzip" && d.Type != "nvd-gzip" && d.Type != "apple-security" && d.Type != "nvd-years" && d.Type != "cve-tar-gzip" && d.Type != "ghsa-tar-gzip" {
+		if d.Type != "osv" && d.Type != "osv-zip" && d.Type != "cisa-kev" && d.Type != "osv-tar-xz" && d.Type != "debian-tracker" && d.Type != "sofa" && d.Type != "epss-gzip" && d.Type != "nvd-gzip" && d.Type != "apple-security" && d.Type != "nvd-years" && d.Type != "cve-tar-gzip" && d.Type != "ghsa-tar-gzip" && d.Type != VEXKind && d.Type != JammyOVALKind {
 			return nil, fmt.Errorf("source %s: unsupported adapter %q", d.ID, d.Type)
 		}
 		if (d.Path == "") == (d.URL == "") {
@@ -151,7 +183,7 @@ func (s *documentSource) Sync(ctx context.Context, _ string) (Batch, error) {
 		reader = resp.Body
 	}
 	defer reader.Close()
-	if d.Type == "osv-tar-xz" || d.Type == "debian-tracker" || d.Type == "sofa" || d.Type == "epss-gzip" || d.Type == "nvd-gzip" || d.Type == "cve-tar-gzip" || d.Type == "ghsa-tar-gzip" {
+	if d.Type == "osv-tar-xz" || d.Type == "debian-tracker" || d.Type == "sofa" || d.Type == "epss-gzip" || d.Type == "nvd-gzip" || d.Type == "cve-tar-gzip" || d.Type == "ghsa-tar-gzip" || d.Type == VEXKind {
 		bounded := &checkedReader{ctx: ctx, r: reader, left: d.MaxBytes}
 		var e error
 		var input io.Reader = bounded
@@ -165,6 +197,8 @@ func (s *documentSource) Sync(ctx context.Context, _ string) (Batch, error) {
 		switch d.Type {
 		case "cve-tar-gzip", "ghsa-tar-gzip":
 			adv, e = parseRepository(ctx, input, d.Type)
+		case VEXKind:
+			e = streamUbuntuVEX(ctx, input, func(a Advisory) error { adv = append(adv, a); return nil })
 		case "osv-tar-xz":
 			adv, e = parseOSVTarKinds(ctx, input, d.RecordKinds)
 		case "debian-tracker":
@@ -207,6 +241,10 @@ func (s *documentSource) Sync(ctx context.Context, _ string) (Batch, error) {
 }
 
 type osv struct {
+	Severity []struct {
+		Type  string
+		Score string
+	} `json:"severity"`
 	ID               string     `json:"id"`
 	Aliases          []string   `json:"aliases"`
 	Upstream         []string   `json:"upstream"`
@@ -243,11 +281,31 @@ func parseOSV(raw json.RawMessage) (Advisory, error) {
 		return Advisory{}, errors.New("OSV record requires id and modified")
 	}
 	for _, id := range o.Upstream {
+		if strings.HasPrefix(o.ID, "USN-") {
+			id = strings.TrimPrefix(id, "UBUNTU-")
+		}
 		if cveID.MatchString(id) {
 			o.Aliases = append(o.Aliases, id)
 		}
 	}
+	if id := strings.TrimPrefix(o.ID, "UBUNTU-"); id != o.ID && cveID.MatchString(id) {
+		if !slices.Contains(o.Aliases, id) {
+			o.Aliases = append(o.Aliases, id)
+		}
+	}
+	for _, entry := range o.Severity {
+		if entry.Type != "Ubuntu" {
+			continue
+		}
+		switch strings.ToUpper(entry.Score) {
+		case "CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE":
+			o.DatabaseSpecific.Severity = strings.ToUpper(entry.Score)
+		}
+	}
 	a := Advisory{ID: o.ID, Aliases: o.Aliases, Summary: o.Summary, Severity: o.DatabaseSpecific.Severity, Published: o.Published, Modified: o.Modified, Withdrawn: o.Withdrawn != nil, Raw: append(json.RawMessage(nil), raw...)}
+	if strings.TrimSpace(o.Details) != "" {
+		a.Summary = o.Details
+	}
 	for _, p := range o.Affected {
 		if p.Package.Name == "" || p.Package.Ecosystem == "" {
 			a.UnmappedAffected++

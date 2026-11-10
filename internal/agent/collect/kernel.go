@@ -2,6 +2,7 @@ package collect
 
 import (
 	"context"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -24,7 +25,15 @@ func (h Host) runningKernel(ctx context.Context, s *inventory.Snapshot) {
 	if s.Host.Release["ID"] == "ubuntu" {
 		if st, e := os.Stat("/var/run/reboot-required"); e == nil && st.Mode().IsRegular() {
 			k.RebootRequired = true
-			s.AddNote(inventory.Unresolved, "kernel-reboot", "Ubuntu reports a pending reboot; verify the loaded kernel after reboot")
+			if f, err := os.Open("/var/run/reboot-required.pkgs"); err == nil {
+				raw, e := io.ReadAll(io.LimitReader(f, 4097))
+				f.Close()
+				if e == nil && len(raw) <= 4096 {
+					k.RebootPackages = rebootPackages(string(raw))
+				}
+			}
+
+			s.AddNote(inventory.Unresolved, "kernel-reboot", "Ubuntu reports a pending reboot; the reason may be unrelated to the kernel")
 		}
 	}
 	var image *inventory.Package
@@ -106,4 +115,21 @@ func ubuntuKernelVersion(release, signature string) string {
 		return ""
 	}
 	return version
+}
+
+var rebootPackageName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{0,127}(:[a-z0-9-]{1,32})?$`)
+
+func rebootPackages(raw string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range strings.Fields(raw) {
+		if !seen[p] && rebootPackageName.MatchString(p) {
+			seen[p] = true
+			out = append(out, p)
+			if len(out) == 32 {
+				break
+			}
+		}
+	}
+	return out
 }

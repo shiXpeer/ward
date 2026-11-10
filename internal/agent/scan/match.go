@@ -1,8 +1,11 @@
 package scan
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"shixpeer.com/ward/internal/agent/database"
 	"strconv"
 	"strings"
 
@@ -47,9 +50,12 @@ func numeric(a, b string) (int, error) {
 }
 
 type decision struct {
-	state, reason string
-	fixed         []string
+	state, reason      string
+	fixed              []string
+	macOSBranchMatched bool
 }
+
+const ubuntuNoBoundary = "Ubuntu OSV has no applicable fixed boundary; tracker status and available remediation need review"
 
 func evaluate(row compactdb.Row, version string, exact bool) decision {
 	if row.Withdrawn || row.Status == "not_affected" {
@@ -59,7 +65,7 @@ func evaluate(row compactdb.Row, version string, exact bool) decision {
 		Fixed         string          `json:"fixed_version"`
 		Applicability string          `json:"applicability"`
 		Module        json.RawMessage `json:"module_name_regex"`
-		Availability  json.RawMessage `json:"availability"`
+		Availability  string          `json:"availability"`
 	}
 	if len(row.Context) > 0 && json.Unmarshal(row.Context, &meta) != nil {
 		return decision{state: "review", reason: "invalid vendor context"}
@@ -76,9 +82,9 @@ func evaluate(row compactdb.Row, version string, exact bool) decision {
 				return decision{state: "review", reason: "unsupported macOS version format"}
 			}
 			if n >= 0 {
-				return decision{state: "excluded"}
+				return decision{state: "excluded", macOSBranchMatched: true}
 			}
-			return decision{state: "review", reason: "vendor lists a newer security release in this macOS branch; applicability requires bulletin review", fixed: []string{meta.Fixed}}
+			return decision{state: "review", macOSBranchMatched: true, reason: "vendor lists a newer security release in this macOS branch; applicability requires bulletin review", fixed: []string{meta.Fixed}}
 		}
 		return decision{state: "review", reason: "macOS advisory has no supported applicability rule"}
 	}
@@ -89,7 +95,7 @@ func evaluate(row compactdb.Row, version string, exact bool) decision {
 		return decision{state: "review", reason: "no supported ecosystem version comparator"}
 	}
 	affected := exact
-	unknown := row.Review || meta.Applicability != "" || len(meta.Module) > 0 || len(meta.Availability) > 0
+	unknown := row.Review || meta.Applicability != "" || len(meta.Module) > 0 || (meta.Availability != "" && meta.Availability != "No subscription required")
 	fixed := []string{}
 	for _, rg := range row.Ranges {
 		yes, fix, e := inRange(version, rg, debversion.Compare)
@@ -104,6 +110,23 @@ func evaluate(row compactdb.Row, version string, exact bool) decision {
 	}
 	if len(row.Ranges) == 0 && len(row.Versions) == 0 && row.VersionSet == "" {
 		unknown = true
+	}
+	// Canonical encodes both untriaged and known vulnerable records without
+	// a fixed boundary; an exact version list does not resolve that ambiguity.
+	if strings.HasPrefix(row.Ecosystem, "Ubuntu:") && strings.HasPrefix(row.ID, "UBUNTU-CVE-") && len(fixed) == 0 && (affected || unknown) {
+		return decision{state: "review", reason: ubuntuNoBoundary}
+	}
+	if unknown && row.Source == "debian-tracker" && strings.HasPrefix(row.Ecosystem, "Debian:") {
+		switch row.Status {
+		case "undetermined":
+			return decision{state: "review", reason: "Debian has not determined whether this release is affected"}
+		case "open":
+			return decision{state: "review", reason: "Debian tracks this as open for the release; the installed version could not be verified", fixed: fixed}
+		case "resolved":
+			return decision{state: "review", reason: "Debian marks this resolved; the fixed version could not be verified", fixed: fixed}
+		default:
+			return decision{state: "review", reason: "Debian provides no usable applicability rule for this release", fixed: fixed}
+		}
 	}
 	if unknown {
 		return decision{state: "review", reason: "vendor applicability or version conditions need review", fixed: fixed}
@@ -255,4 +278,32 @@ func evaluateLanguage(row compactdb.Row, version string, exact bool) decision {
 		return decision{state: "affected", reason: "installed global package identity and stable numeric version match a supported advisory rule", fixed: fixes}
 	}
 	return decision{state: "excluded"}
+}
+
+func evaluateIndexed(ctx context.Context, db *database.Reader, row compactdb.Row, version string) (decision, error) {
+	exact := false
+	for _, v := range row.Versions {
+		if v == version {
+			exact = true
+		}
+	}
+	if row.VersionSet != "" {
+		found := false
+		err := db.Lookup(ctx, "s", row.VersionSet, 2, func(data []byte) error {
+			if compactdb.Digest(data) != row.VersionSet {
+				return fmt.Errorf("version set digest mismatch")
+			}
+			yes, e := compactdb.HasVersion(data, version)
+			exact = exact || yes
+			found = true
+			return e
+		})
+		if err != nil {
+			return decision{}, err
+		}
+		if !found {
+			return decision{}, fmt.Errorf("missing exact version set")
+		}
+	}
+	return evaluate(row, version, exact), nil
 }

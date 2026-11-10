@@ -12,6 +12,8 @@ import (
 	"shixpeer.com/ward/internal/snapshot"
 )
 
+var ErrLookupLimit = errors.New("result limit reached; query is incomplete")
+
 // Reader holds one authenticated publication and a shared generation lock for an
 // entire offline scan. It opens one indexed object per query, never the full DB.
 type Reader struct {
@@ -44,14 +46,26 @@ func (r *Reader) Close() {
 	}
 }
 func (r *Reader) Lookup(ctx context.Context, group, key string, limit int, emit func([]byte) error) error {
+	if limit < 1 || limit > 100000 {
+		return errors.New("reader lookup limit must be 1..100000")
+	}
+	n := 0
+	return r.Walk(ctx, group, key, func(b []byte) error {
+		n++
+		if n > limit {
+			return ErrLookupLimit
+		}
+		return emit(b)
+	})
+}
+
+// Walk verifies and visits the blocks for one key without limiting its row count.
+func (r *Reader) Walk(ctx context.Context, group, key string, emit func([]byte) error) error {
 	if r.unlock == nil {
 		return errors.New("database reader closed")
 	}
 	if group != "p" && group != "v" && group != "r" && group != "s" {
 		return errors.New("invalid lookup group")
-	}
-	if limit < 1 || limit > 100000 {
-		return errors.New("reader lookup limit must be 1..100000")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -65,12 +79,5 @@ func (r *Reader) Lookup(ctx context.Context, group, key string, limit int, emit 
 		return err
 	}
 	defer f.Close()
-	n := 0
-	return f.Find(ctx, compactdb.KeyHash(group, key), func(b []byte) error {
-		n++
-		if n > limit {
-			return errors.New("result limit reached; query is incomplete")
-		}
-		return emit(b)
-	})
+	return f.Find(ctx, compactdb.KeyHash(group, key), emit)
 }

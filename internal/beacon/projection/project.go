@@ -16,7 +16,7 @@ import (
 )
 
 // Version invalidates compiled input caches when projection semantics change.
-const Version = 105
+const Version = 109
 
 func refs(in []string) []string {
 	if len(in) > 3 {
@@ -109,7 +109,53 @@ func redundant(eco string, versions []string, ranges []vuln.Range) bool {
 // Project drops prose/raw documents, not version facts. Unrepresented vendor
 // conditions are marked for review. Large exact lists live in shared disk sets.
 func Project(profile compactdb.Profile, sourceID string, a source.Advisory, put compactdb.Put) error {
+	if len(a.Affected) > 0 && (a.Affected[0].Ecosystem == compactdb.UbuntuVEX || strings.HasPrefix(a.Affected[0].Ecosystem, compactdb.UbuntuJammyOVAL) || a.Affected[0].Ecosystem == compactdb.UbuntuJammyPackageOVAL) {
+		for _, p := range a.Affected {
+			if !profile.Accept(p.Ecosystem) {
+				continue
+			}
+			row := compactdb.Row{Source: sourceID, ID: a.ID, Ecosystem: p.Ecosystem, Package: p.Name, Context: p.EcosystemSpecific}
+			data, err := json.Marshal(row)
+			if err != nil {
+				return err
+			}
+			if err := put("p", compactdb.PackageKey(p.Ecosystem, p.Name), data); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if sourceID == "canonical-osv" && strings.HasPrefix(a.ID, "USN-") {
+		if a.Withdrawn {
+			return nil
+		}
+		for _, p := range a.Affected {
+			if !strings.HasPrefix(p.Ecosystem, "Ubuntu:") || !profile.Accept(p.Ecosystem) {
+				continue
+			}
+			ids := usnPackageCVEs(a, p)
+			if len(ids) == 0 {
+				continue
+			}
+			row := compactdb.Row{Source: sourceID, ID: a.ID, Aliases: ids, Ecosystem: p.Ecosystem, Package: p.Name, Ranges: p.Ranges}
+			raw, err := json.Marshal(row)
+			if err != nil {
+				return err
+			}
+			if err := put("p", compactdb.PackageKey(compactdb.UbuntuUSN, compactdb.PackageKey(p.Ecosystem, p.Name)), raw); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	base := compactdb.Row{Source: sourceID, ID: a.ID, Aliases: a.Aliases, Severity: a.Severity, Withdrawn: a.Withdrawn, References: refs(a.References), Unmapped: a.UnmappedAffected, Review: a.UnmappedAffected > 0 || len(a.Affected) == 0}
+	if !a.KnownExploited && a.Summary != "EPSS exploitation probability" {
+		summary := []rune(strings.Join(strings.Fields(a.Summary), " "))
+		if len(summary) > 600 {
+			summary = append(summary[:599], '…')
+		}
+		base.Summary = string(summary)
+	}
 	if !a.Modified.IsZero() {
 		base.Modified = a.Modified.UTC().Format(time.RFC3339)
 	}

@@ -1,0 +1,297 @@
+{
+  "bundle": {
+    "Electrum": "a:electrum:electrum",
+    "com.adobe.Acrobat.Pro": "a:adobe:acrobat_dc",
+    "com.adobe.Reader": "a:adobe:acrobat_reader_dc",
+    "com.apple.Safari": "a:apple:safari",
+    "com.apple.dt.Xcode": "a:apple:xcode",
+    "com.brave.Browser": "a:brave:brave",
+    "com.docker.docker": "a:docker:docker_desktop",
+    "com.github.Electron": "a:electronjs:electron",
+    "com.google.Chrome": "a:google:chrome",
+    "com.googlecode.iterm2": "a:iterm2:iterm2",
+    "com.hnc.Discord": "a:discord:discord",
+    "com.jetbrains.PhpStorm": "a:jetbrains:phpstorm",
+    "com.microsoft.Excel": "a:microsoft:excel",
+    "com.microsoft.Outlook": "a:microsoft:outlook",
+    "com.microsoft.Powerpoint": "a:microsoft:powerpoint",
+    "com.microsoft.VSCode": "a:microsoft:visual_studio_code",
+    "com.microsoft.Word": "a:microsoft:word",
+    "com.microsoft.edgemac": "a:microsoft:edge",
+    "com.obsproject.obs-studio": "a:obsproject:obs_studio",
+    "com.operasoftware.Opera": "a:opera:opera_browser",
+    "io.tailscale.ipn.macsys": "a:tailscale:tailscale",
+    "org.audacityteam.audacity": "a:audacityteam:audacity",
+    "org.blenderfoundation.blender": "a:blender:blender",
+    "org.chromium.Chromium": "a:chromium:chromium",
+    "org.filezilla-project.filezilla": "a:filezilla-project:filezilla_client",
+    "org.gimp.gimp-2.10": "a:gimp:gimp",
+    "org.gimp.gimp-3.0": "a:gimp:gimp",
+    "org.keepassxc.keepassxc": "a:keepassxc:keepassxc",
+    "org.libreoffice.script": "a:libreoffice:libreoffice",
+    "org.mozilla.firefox": "a:mozilla:firefox",
+    "org.mozilla.thunderbird": "a:mozilla:thunderbird",
+    "org.qbittorrent.qBittorrent": "a:qbittorrent:qbittorrent",
+    "org.videolan.vlc": "a:videolan:vlc_media_player",
+    "org.wireshark.Wireshark": "a:wireshark:wireshark",
+    "us.zoom.xos": "a:zoom:zoom"
+  },
+  "exclusions": [
+    {
+      "cves": [
+        "CVE-2025-15661",
+        "CVE-2026-7598",
+        "CVE-2026-55199",
+        "CVE-2026-55200",
+        "CVE-2026-58050",
+        "CVE-2026-58051",
+        "CVE-2026-66032",
+        "CVE-2026-66033",
+        "CVE-2026-66034",
+        "CVE-2026-66035"
+      ],
+      "formula": "libssh2",
+      "installed": "1.11.1_7",
+      "platforms": [
+        "darwin"
+      ],
+      "product": "a:libssh2:libssh2",
+      "upstream": "1.11.1"
+    },
+    {
+      "cves": [
+        "CVE-2025-25468",
+        "CVE-2025-25469"
+      ],
+      "product": "a:ffmpeg:ffmpeg",
+      "upstream": "9.0.2"
+    },
+    {
+      "bottle": "arm64_golden_gate",
+      "cves": [
+        "CVE-2026-107675"
+      ],
+      "formula": "ffmpeg",
+      "installed": "9.0.2_1",
+      "platforms": [
+        "darwin"
+      ],
+      "product": "a:ffmpeg:ffmpeg",
+      "upstream": "9.0.2"
+    },
+    {
+      "bottle": "arm64_golden_gate",
+      "cves": [
+        "CVE-2026-58469"
+      ],
+      "formula": "wget",
+      "installed": "1.25.0_2",
+      "platforms": [
+        "darwin"
+      ],
+      "product": "a:gnu:wget",
+      "upstream": "1.25.0"
+    },
+    {
+      "cves": [
+        "CVE-2026-3087"
+      ],
+      "platforms": [
+        "darwin",
+        "linux"
+      ],
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2025-12084"
+      ],
+      "fixed_by_branch": {
+        "3.11": "3.11.15",
+        "3.12": "3.12.13",
+        "3.13": "3.13.11",
+        "3.14": "3.14.2"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2025-13462"
+      ],
+      "fixed_by_branch": {
+        "3.11": "3.11.16",
+        "3.12": "3.12.14",
+        "3.13": "3.13.13",
+        "3.14": "3.14.4"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2025-13837"
+      ],
+      "fixed_by_branch": {
+        "3.11": "3.11.15",
+        "3.12": "3.12.13",
+        "3.13": "3.13.10",
+        "3.14": "3.14.1"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2026-3644"
+      ],
+      "fixed_by_branch": {
+        "3.11": "3.11.16",
+        "3.12": "3.12.14",
+        "3.13": "3.13.13",
+        "3.14": "3.14.4"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2026-4519"
+      ],
+      "fixed_by_branch": {
+        "3.11": "3.11.16",
+        "3.12": "3.12.14",
+        "3.13": "3.13.13",
+        "3.14": "3.14.4"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2025-12781"
+      ],
+      "fixed_by_branch": {
+        "3.13": "3.13.10",
+        "3.14": "3.14.1"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2026-6019"
+      ],
+      "fixed_by_branch": {
+        "3.13": "3.13.14",
+        "3.14": "3.14.5"
+      },
+      "product": "a:python:python"
+    },
+    {
+      "cves": [
+        "CVE-2026-3087"
+      ],
+      "fixed_by_branch": {
+        "3.11": "3.11.16",
+        "3.12": "3.12.14",
+        "3.13": "3.13.14",
+        "3.14": "3.14.5"
+      },
+      "product": "a:python:python"
+    }
+  ],
+  "formula": {
+    "abseil": "a:abseil:common_libraries",
+    "aom": "a:aomedia:aomedia_codec",
+    "apr": "a:apache:portable_runtime",
+    "apr-util": "a:apache:apr-util",
+    "bash": "a:gnu:bash",
+    "bind": "a:isc:bind",
+    "brotli": "a:google:brotli",
+    "bzip2": "a:bzip:bzip2",
+    "c-ares": "a:c-ares_project:c-ares",
+    "cmake": "a:kitware:cmake",
+    "curl": "a:haxx:curl",
+    "dav1d": "a:videolan:dav1d",
+    "expat": "a:libexpat:libexpat",
+    "ffmpeg": "a:ffmpeg:ffmpeg",
+    "fontconfig": "a:fontconfig_project:fontconfig",
+    "freetds": "a:freetds:freetds",
+    "freetype": "a:freetype:freetype2",
+    "gd": "a:libgd:libgd",
+    "gdk-pixbuf": "a:gnome:gdk-pixbuf",
+    "git": "a:git-scm:git",
+    "glib": "a:gnome:glib",
+    "gmp": "a:gmplib:gmp",
+    "gnupg": "a:gnupg:gnupg",
+    "gnutls": "a:gnu:gnutls",
+    "go": "a:golang:go",
+    "gpgme": "a:gnupg:gpgme",
+    "gstreamer": "a:gstreamer:gstreamer",
+    "gzip": "a:gnu:gzip",
+    "harfbuzz": "a:harfbuzz_project:harfbuzz",
+    "httpd": "a:apache:http_server",
+    "imagemagick": "a:imagemagick:imagemagick",
+    "jpeg-turbo": "a:libjpeg-turbo:libjpeg-turbo",
+    "json-c": "a:json-c:json-c",
+    "krb5": "a:mit:kerberos_5",
+    "libarchive": "a:libarchive:libarchive",
+    "libgcrypt": "a:gnupg:libgcrypt",
+    "libgpg-error": "a:gnupg:libgpg-error",
+    "libheif": "a:struktur:libheif",
+    "libksba": "a:gnupg:libksba",
+    "libnghttp2": "a:nghttp2:nghttp2",
+    "libpng": "a:libpng:libpng",
+    "librsvg": "a:gnome:librsvg",
+    "libssh": "a:libssh:libssh",
+    "libssh2": "a:libssh2:libssh2",
+    "libtiff": "a:libtiff:libtiff",
+    "libuv": "a:libuv:libuv",
+    "libvpx": "a:webmproject:libvpx",
+    "libwebp": "a:webmproject:libwebp",
+    "libxml2": "a:xmlsoft:libxml2",
+    "libxslt": "a:xmlsoft:libxslt",
+    "lz4": "a:lz4:lz4",
+    "mariadb": "a:mariadb:mariadb",
+    "memcached": "a:memcached:memcached",
+    "mysql": "a:oracle:mysql",
+    "neovim": "a:neovim:neovim",
+    "nghttp2": "a:nghttp2:nghttp2",
+    "nginx": "a:f5:nginx",
+    "node": "a:nodejs:node.js",
+    "node@20": "a:nodejs:node.js",
+    "node@22": "a:nodejs:node.js",
+    "node@24": "a:nodejs:node.js",
+    "oniguruma": "a:oniguruma_project:oniguruma",
+    "openexr": "a:openexr:openexr",
+    "openjdk": "a:oracle:openjdk",
+    "openjdk@17": "a:oracle:openjdk",
+    "openjdk@21": "a:oracle:openjdk",
+    "openssl@1.1": "a:openssl:openssl",
+    "openssl@3": "a:openssl:openssl",
+    "pcre2": "a:pcre:pcre2",
+    "php": "a:php:php",
+    "php@8.2": "a:php:php",
+    "php@8.3": "a:php:php",
+    "php@8.4": "a:php:php",
+    "postgresql@14": "a:postgresql:postgresql",
+    "postgresql@15": "a:postgresql:postgresql",
+    "postgresql@16": "a:postgresql:postgresql",
+    "postgresql@17": "a:postgresql:postgresql",
+    "postgresql@18": "a:postgresql:postgresql",
+    "protobuf": "a:google:protobuf",
+    "python@3.11": "a:python:python",
+    "python@3.12": "a:python:python",
+    "python@3.13": "a:python:python",
+    "python@3.14": "a:python:python",
+    "redis": "a:redis:redis",
+    "rsync": "a:samba:rsync",
+    "ruby": "a:ruby-lang:ruby",
+    "sqlite": "a:sqlite:sqlite",
+    "tar": "a:gnu:tar",
+    "tmux": "a:tmux:tmux",
+    "unbound": "a:nlnetlabs:unbound",
+    "valkey": "a:valkey-io:valkey",
+    "vim": "a:vim:vim",
+    "wget": "a:gnu:wget",
+    "xz": "a:tukaani:xz",
+    "zsh": "a:zsh:zsh",
+    "zstd": "a:facebook:zstandard"
+  },
+  "version": 1
+}

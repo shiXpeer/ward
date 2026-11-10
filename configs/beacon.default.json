@@ -8,8 +8,23 @@
       "max_bytes": 134217728,
       "record_kinds": [
         "cve",
-        "lsn"
+        "lsn",
+        "usn"
       ]
+    },
+    {
+      "id": "ubuntu-vex",
+      "type": "ubuntu-vex-tar-xz",
+      "url": "https://security-metadata.canonical.com/vex/vex-all.tar.xz",
+      "enabled": true,
+      "max_bytes": 134217728
+    },
+    {
+      "id": "ubuntu-oval-jammy",
+      "type": "ubuntu-jammy-oval-bzip2",
+      "url": "https://security-metadata.canonical.com/oval/com.ubuntu.jammy.cve.oval.xml.bz2",
+      "enabled": true,
+      "max_bytes": 33554432
     },
     {
       "id": "debian-tracker",

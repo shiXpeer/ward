@@ -35,7 +35,7 @@ func Export(ctx context.Context, dir string, s catalog.Summary, key ed25519.Priv
 		return m, e
 	}
 	defer unlock()
-	m = snapshot.Manifest{Version: snapshot.Version, Format: compactdb.Format, Revision: now.UnixNano(), CreatedAt: now.UTC(), ExpiresAt: now.Add(ttl).UTC(), BaseURL: base, Profile: s.Profile, Generation: s.Generation, Sources: s.Sources}
+	m = snapshot.Manifest{Version: snapshot.Version, Format: compactdb.Format, Revision: now.UnixNano(), CreatedAt: now.UTC(), ExpiresAt: now.Add(ttl).UTC(), BaseURL: base, Profile: s.Profile, Generation: s.Generation, Sources: s.Sources, ProductPolicy: s.ProductPolicy}
 	var old snapshot.Manifest
 	if b, e := os.ReadFile(filepath.Join(dir, "manifest.json")); e == nil {
 		old, _ = snapshot.Verify(b, key.Public().(ed25519.PublicKey), now)

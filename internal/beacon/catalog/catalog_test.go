@@ -3,6 +3,11 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"shixpeer.com/ward/internal/atomicfile"
@@ -183,5 +188,62 @@ func TestPublicationChecksRetainedSourceAge(t *testing.T) {
 	}
 	if _, err := Publication(dir); err == nil {
 		t.Fatal("stale retained source published")
+	}
+}
+
+func TestSyncDownloadsSourcesConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	arrivals := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrivals <- struct{}{}
+		select {
+		case <-release:
+			fmt.Fprint(w, `{"id":"OSV-TEST","modified":"2026-10-30T00:00:00Z","affected":[{"package":{"ecosystem":"npm","name":"example"},"versions":["1.0.0"]}]}`)
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "sources.json")
+	var cfg source.Config
+	for _, id := range []string{"first", "second"} {
+		cfg.Sources = append(cfg.Sources, source.Definition{ID: id, Type: "osv", Enabled: true, URL: server.URL + "/" + id, CAFile: ca, AllowedHosts: []string{u.Hostname()}})
+	}
+	if err := atomicfile.JSON(config, cfg); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := source.Load(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := SyncWithWorkers(ctx, dir, sources, compactdb.All, false, 2)
+		result <- err
+	}()
+	for range sources {
+		select {
+		case <-arrivals:
+		case err := <-result:
+			t.Fatalf("sync finished before both requests arrived: %v", err)
+		case <-ctx.Done():
+			cancel()
+			<-result
+			t.Fatal("source requests did not overlap")
+		}
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }

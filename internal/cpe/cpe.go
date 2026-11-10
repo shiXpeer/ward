@@ -10,6 +10,8 @@ import (
 )
 
 const RuleFormat = "nvd-cpe-v1"
+const DockerDesktop = "a:docker:docker_desktop"
+const DockerDesktopRuleFormat = "nvd-cpe-docker-desktop-v1"
 
 type Name struct{ Part, Vendor, Product, Version, Update, Edition, Language, SWEdition, TargetSW, TargetHW, Other string }
 

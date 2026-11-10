@@ -160,7 +160,8 @@ func Prepare(ctx context.Context, src Source, cache string) ([]Input, error) {
 		out = append(out, a)
 	}
 	if len(out) > 0 {
-		out[0].Dependencies = []string{in.Path}
+		out[0].Dependencies = append(out[0].Dependencies, in.Path)
+		out[0].Dependencies = append(out[0].Dependencies, in.Dependencies...)
 	}
 	return out, nil
 }
@@ -186,11 +187,26 @@ func cachedInput(ctx context.Context, d Definition, target, cache string) (Input
 	}
 	sum := sha256.Sum256([]byte(target))
 	id := hex.EncodeToString(sum[:])
+	budget, _ := ctx.Value(downloadKey{}).(*downloadBudget)
+	if budget != nil {
+		release, err := budget.acquire(ctx, sum[0])
+		if err != nil {
+			return Input{}, err
+		}
+		defer release()
+	}
+	prepared := func(path, digest string) (Input, error) {
+		if budget != nil {
+			return budget.pin(path, id, digest)
+		}
+		return Input{Path: path, Digest: digest}, nil
+	}
+
 	data := filepath.Join(cache, id+".body")
 	meta := filepath.Join(cache, id+".json")
 	var old cacheMeta
 	have := atomicfile.ReadJSON(meta, &old, 8192) == nil
-	if st, e := os.Stat(data); e != nil || st.Size() != old.Bytes {
+	if st, e := os.Stat(data); e != nil || st.Size() != old.Bytes || old.Bytes > d.MaxBytes {
 		have = false
 	}
 	c, e := netpolicy.Client(d.CAFile, d.AllowedHosts)
@@ -219,7 +235,7 @@ func cachedInput(ctx context.Context, d Definition, target, cache string) (Input
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 304 && have {
-		return Input{Path: data, Digest: old.Digest}, nil
+		return prepared(data, old.Digest)
 	}
 	if resp.StatusCode != 200 {
 		return Input{}, fmt.Errorf("source returned HTTP %d", resp.StatusCode)
@@ -251,7 +267,7 @@ func cachedInput(ctx context.Context, d Definition, target, cache string) (Input
 	if e = atomicfile.JSON(meta, m); e != nil {
 		return Input{}, e
 	}
-	return Input{Path: data, Digest: m.Digest}, nil
+	return prepared(data, m.Digest)
 }
 func Walk(ctx context.Context, in Input, emit func(Advisory) error) error {
 	f, e := os.Open(in.Path)
@@ -261,6 +277,10 @@ func Walk(ctx context.Context, in Input, emit func(Advisory) error) error {
 	defer f.Close()
 	r := io.Reader(&checkedReader{ctx: ctx, r: f, left: 512 << 20})
 	switch in.Kind {
+	case JammyOVALKind:
+		return streamJammyOVAL(ctx, f, emit)
+	case VEXKind:
+		return streamUbuntuVEX(ctx, r, emit)
 	case "osv-tar-xz":
 		return streamOSVTar(ctx, r, in.Kinds, emit)
 	case "cve-tar-gzip", "ghsa-tar-gzip":

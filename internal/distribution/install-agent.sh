@@ -75,7 +75,7 @@ as_user() { runuser -u "$user_name" -- env -i HOME="$home_dir" PATH=/usr/sbin:/u
 chmod 711 "$tmp"
 chmod 644 "$tmp/agent" "$tmp/feed.pub"
 if [[ -n $ca ]]; then install -m 644 "$ca" "$tmp/ca.crt"; fi
-as_user install -d -m 700 "$base" "$base/bin" "$base/config"
+as_user install -d -m 700 "$base" "$base/bin" "$base/config" "$base/agent"
 if [[ -f $base/config/install-key.sha256 && $(as_user cat "$base/config/install-key.sha256") != "$actual" ]]; then echo 'Installed publisher key differs; refusing implicit trust rotation.' >&2; exit 1; fi
 manifest_hash=$(sha256sum "$tmp/agents.txt" | awk '{print $1}')
 if [[ -f $base/config/install-revision ]]; then
@@ -95,13 +95,14 @@ unit=$(mktemp /etc/systemd/system/.shixpeer-ward-agent.XXXXXX)
 cat > "$unit" <<UNIT
 [Unit]
 Description=Shixpeer Ward local security reports and signed database sync
-After=network-online.target
-Wants=network-online.target
+After=network-online.target shixpeer-ward-agent-capture.service
+Wants=network-online.target shixpeer-ward-agent-capture.service
 [Service]
 Type=simple
 User=$user_name
 Environment=HOME=$home_dir
-ExecStart=$base/bin/shixpeer-ward-agent run -feed-interval 6h -collect-interval 1h
+Environment=SHIXPEER_WARD_MANAGED_CAPTURE=1
+ExecStart=$base/bin/shixpeer-ward-agent run -feed-interval 1m -collect-interval 1h
 WorkingDirectory=$home_dir
 UMask=0077
 Restart=on-failure
@@ -122,7 +123,60 @@ WantedBy=multi-user.target
 UNIT
 chmod 644 "$unit"
 mv -f "$unit" /etc/systemd/system/shixpeer-ward-agent.service
+# Root executes only the verified, root-owned copy. The unprivileged
+# receiver writes the snapshot, including the atomic rename inside its HOME.
+install -d -o root -g root -m 0755 /usr/local/libexec/shixpeer-ward
+install -o root -g root -m 0755 "$tmp/agent" /usr/local/libexec/shixpeer-ward/.shixpeer-ward-agent-next
+mv -fT /usr/local/libexec/shixpeer-ward/.shixpeer-ward-agent-next /usr/local/libexec/shixpeer-ward/shixpeer-ward-agent
+cat > "$tmp/capture" <<'CAPTURE'
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+snapshot=$(mktemp)
+trap 'rm -f -- "$snapshot"' EXIT
+/usr/local/libexec/shixpeer-ward/shixpeer-ward-agent capture-docker > "$snapshot"
+runuser -u "$1" -- /bin/bash -c '
+    set -euo pipefail
+    umask 077
+    tmp=$(mktemp "$1/.docker-snapshot.XXXXXXXX")
+    trap '"'"'rm -f -- "$tmp"'"'"' EXIT
+    cat > "$tmp"
+    [[ -s $tmp ]]
+    mv -fT -- "$tmp" "$1/docker-snapshot.json"
+  ' bash "$2" < "$snapshot"
+CAPTURE
+install -o root -g root -m 0755 "$tmp/capture" /usr/local/libexec/shixpeer-ward/shixpeer-ward-capture
+cat > "$tmp/capture.service" <<UNIT
+[Unit]
+Description=Capture Shixpeer Ward Docker and local firewall evidence
+Before=shixpeer-ward-agent.service
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/libexec/shixpeer-ward/shixpeer-ward-capture $user_name $base/agent
+TimeoutStartSec=75s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=$base/agent
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+UNIT
+cat > "$tmp/capture.timer" <<'UNIT'
+[Unit]
+Description=Refresh Shixpeer Ward Docker and firewall evidence
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+install -m 644 "$tmp/capture.service" /etc/systemd/system/shixpeer-ward-agent-capture.service
+install -m 644 "$tmp/capture.timer" /etc/systemd/system/shixpeer-ward-agent-capture.timer
 systemctl daemon-reload
+systemctl enable --now shixpeer-ward-agent-capture.timer
 systemctl enable shixpeer-ward-agent.service
 systemctl restart shixpeer-ward-agent.service
 printf '%s\n' "$actual" > "$tmp/pin"

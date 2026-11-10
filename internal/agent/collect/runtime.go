@@ -33,6 +33,13 @@ func bindScope(host string) string {
 	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
 		return "private"
 	}
+	if !ip.IsGlobalUnicast() {
+		return "non-global"
+	}
+	// Shared carrier NAT space is not a public address.
+	if v := ip.To4(); v != nil && v[0] == 100 && v[1]&192 == 64 {
+		return "shared-address"
+	}
 	return "public-address"
 }
 func endpoint(s string) (string, int, error) {
@@ -120,7 +127,7 @@ func (h Host) runtimeState(ctx context.Context, s *inventory.Snapshot) {
 		}
 	}
 	s.AddNote(inventory.NotChecked, "process-scope", "service registry and socket owners are collected; a complete process/command-line inventory is deliberately not read")
-	s.AddNote(inventory.Unresolved, "reachability", "socket bindings are local evidence only; NAT, firewall, cloud rules and external reachability are not tested; unprivileged process visibility may be limited")
+	s.AddNote(inventory.Unresolved, "reachability", "external reachability is unverified; local ingress verdicts apply only to the interface and address shown")
 	h.containers(ctx, s)
 }
 func parseLaunchctl(text string, s *inventory.Snapshot) {
@@ -217,11 +224,12 @@ func parseSS(text string, s *inventory.Snapshot) error {
 		if e != nil {
 			continue
 		}
+		host = strings.Trim(host, "[]")
 		family := "IPv4"
 		if strings.Contains(host, ":") {
 			family = "IPv6"
 		}
-		l := inventory.Listener{Family: family, Protocol: f[0], Port: port, BindScope: bindScope(host), Evidence: "ss", Reachability: "UNKNOWN"}
+		l := inventory.Listener{BindAddress: host, Family: family, Protocol: f[0], Port: port, BindScope: bindScope(host), Evidence: "ss", Reachability: "UNKNOWN"}
 		if m := ssProcess.FindStringSubmatch(strings.Join(f[6:], " ")); len(m) > 0 {
 			l.Process = m[1]
 			l.PID, _ = strconv.Atoi(m[2])
@@ -234,6 +242,18 @@ func parseSS(text string, s *inventory.Snapshot) error {
 	return nil
 }
 func (h Host) containers(ctx context.Context, s *inventory.Snapshot) {
+	if h.DockerSnapshotPath != "" && h.loadDockerSnapshot(s) {
+		return
+	}
+	if os.Getenv("SHIXPEER_WARD_MANAGED_CAPTURE") == "1" {
+		s.AddNote(inventory.Unavailable, "containers", "automatic Docker snapshot unavailable")
+		s.AddNote(inventory.Unavailable, "firewall", "automatic firewall snapshot unavailable")
+		return
+	}
+	h.collectDocker(ctx, s)
+}
+
+func (h Host) collectDocker(ctx context.Context, s *inventory.Snapshot) {
 	sockets := []string{"/var/run/docker.sock"}
 	if home, e := os.UserHomeDir(); e == nil {
 		sockets = append(sockets, filepath.Join(home, ".docker", "run", "docker.sock"))
@@ -256,7 +276,7 @@ func (h Host) docker(ctx context.Context, s *inventory.Snapshot, socket string) 
 	args := append(append([]string{}, prefix...), "container", "ls", "--quiet", "--no-trunc")
 	out, e := h.commandLimit(ctx, 1<<20, "docker", args...)
 	if e != nil {
-		s.AddNote(inventory.Unavailable, "containers", "local Docker listing unavailable; no privilege escalation attempted")
+		s.AddNote(inventory.Unavailable, "containers", "local Docker listing failed; Docker inventory is unknown (check CLI/daemon/socket access). No privilege escalation attempted")
 		return
 	}
 	ids := strings.Fields(string(out))
@@ -264,7 +284,7 @@ func (h Host) docker(ctx context.Context, s *inventory.Snapshot, socket string) 
 		s.AddNote(inventory.Truncated, "containers", "container limit reached")
 		ids = ids[:1000]
 	}
-	const format = `{"name":{{json .Name}},"image":{{json .Config.Image}},"image_id":{{json .Image}},"started_at":{{json .State.StartedAt}},"ports":{{json .NetworkSettings.Ports}}}`
+	const format = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Config.Image}},"image_id":{{json .Image}},"started_at":{{json .State.StartedAt}},"ports":{{json .NetworkSettings.Ports}}}`
 	for start := 0; start < len(ids); start += 32 {
 		end := start + 32
 		if end > len(ids) {
@@ -287,7 +307,18 @@ func (h Host) docker(ctx context.Context, s *inventory.Snapshot, socket string) 
 			s.AddNote(inventory.Unavailable, "containers", "invalid container metadata")
 		}
 	}
-	s.AddNote(inventory.NotChecked, "container-packages", "container images/ports are inventoried; packages inside containers are not inspected and image tags are not used as package versions")
+	packages := 0
+	for i := range s.Containers {
+		c := &s.Containers[i]
+		if len(c.ID) != 64 || strings.Trim(c.ID, "0123456789abcdef") != "" || packages >= 20000 || ctx.Err() != nil {
+			s.AddNote(inventory.Unavailable, "container-packages", "container identity or package collection budget unavailable")
+			break
+		}
+		if err := h.dockerPackages(ctx, socket, c); err != nil {
+			s.AddNote(inventory.Unavailable, "container-packages", "Debian or Ubuntu package inventory unavailable for "+c.Name)
+		}
+		packages += len(c.Packages)
+	}
 }
 func parseDocker(text string, s *inventory.Snapshot) error {
 	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
@@ -295,6 +326,7 @@ func parseDocker(text string, s *inventory.Snapshot) error {
 			continue
 		}
 		var r struct {
+			ID      string                                         `json:"id"`
 			Name    string                                         `json:"name"`
 			Image   string                                         `json:"image"`
 			ImageID string                                         `json:"image_id"`
@@ -304,7 +336,7 @@ func parseDocker(text string, s *inventory.Snapshot) error {
 		if e := json.Unmarshal([]byte(line), &r); e != nil {
 			return e
 		}
-		c := inventory.Container{Name: strings.TrimPrefix(r.Name, "/"), Image: r.Image, ImageID: r.ImageID, StartedAt: r.Started}
+		c := inventory.Container{ID: r.ID, Name: strings.TrimPrefix(r.Name, "/"), Image: r.Image, ImageID: r.ImageID, StartedAt: r.Started}
 		for key, bindings := range r.Ports {
 			dest, proto, ok := strings.Cut(key, "/")
 			if !ok {
@@ -319,7 +351,7 @@ func parseDocker(text string, s *inventory.Snapshot) error {
 				if strings.Contains(p.HostIP, ":") {
 					family = "IPv6"
 				}
-				c.Ports = append(c.Ports, inventory.PublishedPort{Family: family, Protocol: proto, HostPort: port, ContainerPort: dest, BindScope: bindScope(p.HostIP), Evidence: "docker-inspect", Reachability: "UNKNOWN"})
+				c.Ports = append(c.Ports, inventory.PublishedPort{BindAddress: p.HostIP, Family: family, Protocol: proto, HostPort: port, ContainerPort: dest, BindScope: bindScope(p.HostIP), Evidence: "docker-inspect", Reachability: "UNKNOWN"})
 			}
 		}
 		s.Containers = append(s.Containers, c)

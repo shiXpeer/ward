@@ -1,4 +1,4 @@
-VERSION ?= 0.4.0-dev
+VERSION ?= 0.4.8-dev
 LDFLAGS = -s -w -X shixpeer.com/ward/internal/buildinfo.Version=$(VERSION)
 .PHONY: build test check fmt clean
 build:
@@ -29,7 +29,7 @@ ubuntu-bundle:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags '$(LDFLAGS)' -o dist/ubuntu/bin/shixpeer-ward-beacon-linux-arm64 ./cmd/shixpeer-ward-beacon
 	cp configs/beacon.default.json dist/ubuntu/configs/
 	cp packaging/shixpeer-ward-install-beacon.sh dist/ubuntu/packaging/
-	cp docs/ubuntu-deployment.ru.md dist/ubuntu/docs/
+	cp docs/ubuntu-deployment.ru.md docs/ubuntu-update.ru.md dist/ubuntu/docs/
 	cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/ubuntu/
 	install -m 0644 "$$(go env GOROOT)/LICENSE" dist/ubuntu/GO_LICENSE
 	COPYFILE_DISABLE=1 tar --no-xattrs $(if $(filter Darwin,$(shell uname -s)),--no-mac-metadata) -czf dist/shixpeer-ward-ubuntu.tar.gz -C dist ubuntu

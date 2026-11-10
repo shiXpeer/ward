@@ -25,6 +25,7 @@ import (
 	"shixpeer.com/ward/internal/identity"
 	"shixpeer.com/ward/internal/netpolicy"
 	"shixpeer.com/ward/internal/paths"
+	"shixpeer.com/ward/internal/productid"
 	"strings"
 	"sync"
 	"syscall"
@@ -59,7 +60,10 @@ func run(args []string) error {
 	binaries := fs.String("binaries", "", "release: directory containing Linux agents for amd64 and arm64")
 	releaseTTL := fs.Duration("release-ttl", 7*24*time.Hour, "release: installer artifact validity, max 30d")
 	dir := fs.String("state", paths.State("beacon"), "private state directory, no SQL required")
+	defaultVEX := fs.Bool("with-default-ubuntu-vex", false, "add the default VEX companion to legacy Canonical OSV configurations")
+	sourceWorkers := fs.Int("source-workers", catalog.DefaultSourceWorkers, "maximum concurrent source downloads (1–8)")
 	retain := fs.Bool("keep-other-sources", false, "sync selected sources while retaining existing sources and their freshness")
+	policy := fs.String("product-policy", "", "publisher JSON product policy override for sync or run")
 	config := fs.String("sources", paths.Config("beacon"), "local JSON source configuration")
 	pki := fs.String("pki", "", "new identity directory (init only)")
 	hosts := fs.String("hosts", "localhost,127.0.0.1,::1", "TLS SAN hostnames/IPs (init only)")
@@ -120,10 +124,15 @@ func run(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if *policy != "" && (cmd == "sync" || cmd == "run") {
+		if err := productid.Load(*policy); err != nil {
+			return err
+		}
+	}
 	var sources []source.Source
 	if cmd == "sync" || cmd == "run" || cmd == "check-sources" {
 		var e error
-		sources, e = source.Load(*config)
+		sources, e = source.LoadWithDefaultVEX(*config, *defaultVEX)
 		if e != nil {
 			return e
 		}
@@ -142,18 +151,15 @@ func run(args []string) error {
 		if e != nil {
 			return e
 		}
+		started := time.Now()
 		m, e := exporter.Export(ctx, *out, summary, key, *base, *ttl, time.Now())
 		if e == nil {
-			fmt.Printf("exported revision=%d objects=%d profile=%s\n", m.Revision, len(m.Objects), m.Profile)
+			fmt.Printf("exported revision=%d objects=%d profile=%s publication=%s\n", m.Revision, len(m.Objects), m.Profile, time.Since(started).Round(time.Millisecond))
 		}
 		return e
 	}
 	update := func() error {
-		syncSources := catalog.Sync
-		if *retain {
-			syncSources = catalog.SyncSelected
-		}
-		summary, e := syncSources(ctx, *dir, sources, compactdb.Profile(*profile))
+		summary, e := catalog.SyncWithWorkers(ctx, *dir, sources, compactdb.Profile(*profile), *retain, *sourceWorkers)
 		if e != nil {
 			return e
 		}

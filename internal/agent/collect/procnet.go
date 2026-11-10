@@ -89,7 +89,7 @@ func parseProcNet(text, kind string, s *inventory.Snapshot) error {
 		if len(s.Listeners) >= maxRuntime {
 			return fmt.Errorf("socket limit reached")
 		}
-		s.Listeners = append(s.Listeners, inventory.Listener{Family: family, Protocol: proto, Port: int(p), BindScope: bindScope(net.IP(raw).String()), Evidence: "proc-net", Reachability: "UNKNOWN"})
+		s.Listeners = append(s.Listeners, inventory.Listener{BindAddress: net.IP(raw).String(), Family: family, Protocol: proto, Port: int(p), BindScope: bindScope(net.IP(raw).String()), Evidence: "proc-net", Reachability: "UNKNOWN"})
 	}
 	return nil
 }

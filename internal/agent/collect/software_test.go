@@ -80,6 +80,89 @@ func TestBundleEnumerationDoesNotExecuteAppsOrFollowSymlinks(t *testing.T) {
 		}
 	}
 }
+func TestLaunchedApplicationsOutsideStandardFolders(t *testing.T) {
+	home := t.TempDir()
+	opened := filepath.Join(t.TempDir(), "Dock Expose.app")
+	helper := filepath.Join(t.TempDir(), "Library", "Helper.app")
+	unopened := filepath.Join(t.TempDir(), "Quiet.app")
+	nested := filepath.Join(t.TempDir(), "Outer.app", "Contents", "Inner.app")
+	built := filepath.Join(t.TempDir(), "node_modules", "Tool.app")
+	for _, path := range []string{opened, helper, unopened, nested, built} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefs := filepath.Join(home, "Library", "Preferences")
+	if err := os.MkdirAll(prefs, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"com.example.opened", "com.example.helper"} {
+		if err := os.WriteFile(filepath.Join(prefs, id+".plist"), []byte("bplist"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := Host{Command: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "mdfind":
+			if len(args) != 1 || args[0] != "kMDItemContentTypeTree == 'com.apple.application-bundle'" {
+				t.Fatalf("mdfind args %v", args)
+			}
+			return []byte(strings.Join([]string{
+				opened + "/Contents/MacOS/Dock",
+				helper,
+				unopened,
+				nested,
+				built,
+				"/Applications/Already.app",
+				"relative.app",
+			}, "\n")), nil
+		case "plutil":
+			plist := args[len(args)-1]
+			switch {
+			case strings.Contains(plist, "Dock Expose.app"):
+				return []byte(`{"CFBundleName":"Dock Exposé","CFBundleIdentifier":"com.example.opened","CFBundleShortVersionString":"4.00.8"}`), nil
+			case strings.Contains(plist, "Helper.app"):
+				return []byte(`{"CFBundleName":"Helper","CFBundleIdentifier":"com.example.helper","CFBundleShortVersionString":"1"}`), nil
+			case strings.Contains(plist, "Quiet.app"):
+				return []byte(`{"CFBundleName":"Quiet","CFBundleIdentifier":"com.example.quiet","CFBundleShortVersionString":"1"}`), nil
+			default:
+				return nil, errors.New("unreadable plist")
+			}
+		default:
+			t.Fatalf("unexpected command %s", name)
+			return nil, errors.New("unexpected")
+		}
+	}}
+	s := inventory.Snapshot{
+		Applications: []inventory.Application{{Name: "Already", Identifier: "com.example.already", Version: "1"}},
+		Coverage:     []inventory.Note{},
+	}
+	h.launchedApplications(context.Background(), &s, home)
+	if len(s.Applications) != 2 || s.Applications[1].Identifier != "com.example.opened" || s.Applications[1].Version != "4.00.8" {
+		t.Fatal(s.Applications)
+	}
+	if len(s.Coverage) != 0 {
+		t.Fatal(s.Coverage)
+	}
+}
+
+func TestLaunchedApplicationsReportsSpotlightFailure(t *testing.T) {
+	s := inventory.Snapshot{
+		Applications: []inventory.Application{{Name: "Kept", Identifier: "com.example.kept", Version: "1"}},
+		Coverage:     []inventory.Note{},
+	}
+	h := Host{Command: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name != "mdfind" {
+			t.Fatal(name)
+		}
+		return nil, errors.New("spotlight unavailable")
+	}}
+	h.launchedApplications(context.Background(), &s, t.TempDir())
+	if len(s.Applications) != 1 || len(s.Coverage) != 1 || s.Coverage[0].Code != inventory.Unavailable {
+		t.Fatal(s.Applications, s.Coverage)
+	}
+}
+
 func TestOutputLimit(t *testing.T) {
 	b := limitedOutput{limit: 4}
 	if _, e := b.Write([]byte("1234")); e != nil {

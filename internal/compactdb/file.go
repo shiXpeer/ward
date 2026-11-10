@@ -6,7 +6,9 @@ import (
 	"compress/gzip"
 	"container/heap"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -120,10 +122,11 @@ func (b *Builder) Close() error {
 }
 
 type Bucket struct {
-	Slot  string `json:"slot"`
-	Path  string `json:"-"`
-	Rows  int64  `json:"rows"`
-	Bytes int64  `json:"bytes"`
+	Slot        string `json:"slot"`
+	Path        string `json:"-"`
+	Rows        int64  `json:"rows"`
+	Bytes       int64  `json:"bytes"`
+	InputDigest string `json:"input_digest,omitempty"`
 }
 
 func ValidSlot(s string) bool {
@@ -143,41 +146,101 @@ func ValidSlot(s string) bool {
 	return true
 }
 func (b *Builder) Finish(ctx context.Context, out string) ([]Bucket, error) {
+	buckets, _, err := b.FinishIncremental(ctx, out, nil)
+	return buckets, err
+}
+
+// FinishIncremental compares complete per-shard inputs. Deleted rows change
+// the digest, and an empty shard has no spool and is omitted entirely.
+func (b *Builder) FinishIncremental(ctx context.Context, out string, previous []Bucket) ([]Bucket, int, error) {
 	if e := b.Close(); e != nil {
-		return nil, e
+		return nil, 0, e
 	}
 	if e := os.MkdirAll(out, 0700); e != nil {
-		return nil, e
+		return nil, 0, e
 	}
 	if e := partition(ctx, b.dir); e != nil {
-		return nil, e
+		return nil, 0, e
 	}
 	files, e := filepath.Glob(filepath.Join(b.dir, "*.spool"))
 	if e != nil {
-		return nil, e
+		return nil, 0, e
+	}
+	old := map[string]Bucket{}
+	for _, bucket := range previous {
+		old[bucket.Slot] = bucket
 	}
 	var result []Bucket
+	reused := 0
+	buf := make([]byte, 128<<10)
 	for _, p := range files {
-		if e = ctx.Err(); e != nil {
-			return nil, e
-		}
 		slot := filepath.Base(p)[:4]
 		dest := filepath.Join(out, slot+".wdb")
-		n, e := sortBucket(ctx, p, dest, b.dir)
-		if e != nil {
-			return nil, e
+		digest, err := spoolDigest(ctx, p, buf)
+		if err != nil {
+			return nil, 0, err
 		}
-		st, e := os.Stat(dest)
-		if e != nil {
-			return nil, e
+		bucket := old[slot]
+		if bucket.InputDigest == digest && reuseBucket(bucket, dest) {
+			reused++
+			bucket.Path = dest
+		} else {
+			n, err := sortBucket(ctx, p, dest, b.dir)
+			if err != nil {
+				return nil, 0, err
+			}
+			st, err := os.Stat(dest)
+			if err != nil {
+				return nil, 0, err
+			}
+			bucket = Bucket{Slot: slot, Path: dest, Rows: n, Bytes: st.Size(), InputDigest: digest}
 		}
-		result = append(result, Bucket{slot, dest, n, st.Size()})
-		if e = os.Remove(p); e != nil {
-			return nil, e
+		result = append(result, bucket)
+		if err := os.Remove(p); err != nil {
+			return nil, 0, err
 		}
 	}
-	return result, nil
+	return result, reused, nil
 }
+
+func reuseBucket(old Bucket, dest string) bool {
+	info, err := os.Stat(old.Path)
+	if err != nil || info.Size() != old.Bytes {
+		return false
+	}
+	f, err := Open(old.Path)
+	if err != nil {
+		return false
+	}
+	valid := f.Rows == uint64(old.Rows)
+	f.Close()
+	return valid && os.Link(old.Path, dest) == nil
+}
+
+func spoolDigest(ctx context.Context, path string, buf []byte) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, err := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if err == io.EOF {
+			return hex.EncodeToString(h.Sum(nil)), nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
 func sortBucket(ctx context.Context, src, dst, temp string) (int64, error) {
 	f, e := os.Open(src)
 	if e != nil {

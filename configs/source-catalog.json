@@ -39,12 +39,12 @@
     {
       "id": "ubuntu-vex",
       "scope": "ubuntu",
-      "url": "https://documentation.ubuntu.com/security/security-updates/vex/",
-      "format": "openvex",
-      "status": "adapter-required",
+      "url": "https://security-metadata.canonical.com/vex/vex-all.tar.xz",
+      "format": "ubuntu-vex-tar-xz",
+      "status": "enabled-by-default",
       "role": "vendor applicability",
       "documentation": "https://documentation.ubuntu.com/security/security-updates/vex/",
-      "notes": "Documentation endpoint; complements OSV, not independent coverage.",
+      "notes": "Exact source package and release statements supplement Ubuntu OSV applicability.",
       "redistribution": "Review upstream terms before redistribution"
     },
     {

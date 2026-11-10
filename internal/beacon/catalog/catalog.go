@@ -19,21 +19,27 @@ import (
 	"shixpeer.com/ward/internal/compactdb"
 	"shixpeer.com/ward/internal/cpe"
 	"shixpeer.com/ward/internal/filelock"
+	"shixpeer.com/ward/internal/productid"
+	"shixpeer.com/ward/internal/snapshot"
+	"slices"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
 type SourceStatus = compactdb.SourceStatus
 
 type Summary struct {
-	Format     int                `json:"format"`
-	Profile    compactdb.Profile  `json:"profile"`
-	Generation string             `json:"generation"`
-	Sources    []SourceStatus     `json:"sources"`
-	Buckets    []compactdb.Bucket `json:"buckets"`
-	Bytes      int64              `json:"bytes"`
-	Rows       int64              `json:"rows"`
-	CompiledAt time.Time          `json:"compiled_at"`
+	ProductPolicy *snapshot.ProductPolicy `json:"product_policy,omitempty"`
+	Format        int                     `json:"format"`
+	Profile       compactdb.Profile       `json:"profile"`
+	Generation    string                  `json:"generation"`
+	Sources       []SourceStatus          `json:"sources"`
+	Buckets       []compactdb.Bucket      `json:"buckets"`
+	Bytes         int64                   `json:"bytes"`
+	Rows          int64                   `json:"rows"`
+	CompiledAt    time.Time               `json:"compiled_at"`
 }
 type compiled struct {
 	Source string `json:"source,omitempty"`
@@ -65,7 +71,7 @@ func Load(dir string) (Summary, error) {
 	}
 	return s, nil
 }
-func compile(ctx context.Context, dir string, ss []source.Source, profile compactdb.Profile, retain bool) (Summary, error) {
+func compile(ctx context.Context, dir string, ss []source.Source, profile compactdb.Profile, retain bool, workers int) (Summary, error) {
 	var empty Summary
 	if e := profile.Validate(); e != nil {
 		return empty, e
@@ -97,16 +103,71 @@ func compile(ctx context.Context, dir string, ss []source.Source, profile compac
 		return empty, e
 	}
 	var paths, fingerprints, rawPaths []string
-	summary := Summary{Format: compactdb.Format, Profile: profile, CompiledAt: time.Now().UTC()}
-	for _, src := range ss {
-		log.Printf("preparing source=%s", src.ID())
+	summary := Summary{ProductPolicy: previous.ProductPolicy, Format: compactdb.Format, Profile: profile, CompiledAt: time.Now().UTC()}
+	entries, e := os.ReadDir(cache)
+	if e != nil {
+		return empty, e
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "prepared-") {
+			if e = os.RemoveAll(filepath.Join(cache, entry.Name())); e != nil {
+				return empty, e
+			}
+		}
+	}
+	pins, e := os.MkdirTemp(cache, "prepared-")
+	if e != nil {
+		return empty, e
+	}
+	defer os.RemoveAll(pins)
+	fetchCtx, cancel := context.WithCancel(source.WithDownloadBudget(ctx, workers, pins))
+	type prepared struct {
+		inputs  []source.Input
+		checked time.Time
+		err     error
+	}
+	results := make([]chan prepared, len(ss))
+	jobs := make(chan int, len(ss))
+	for i := range ss {
+		results[i] = make(chan prepared, 1)
+		jobs <- i
+	}
+	close(jobs)
+	var downloads sync.WaitGroup
+	for range min(workers, len(ss)) {
+		downloads.Go(func() {
+			for i := range jobs {
+				if fetchCtx.Err() != nil {
+					return
+				}
+				src := ss[i]
+				log.Printf("preparing source=%s", src.ID())
+				deadline, stop := context.WithTimeout(fetchCtx, 20*time.Minute)
+				started := time.Now()
+				inputs, err := source.Prepare(deadline, src, filepath.Join(cache, "raw"))
+				log.Printf("download source=%s duration=%s inputs=%d", src.ID(), time.Since(started).Round(time.Millisecond), len(inputs))
+				stop()
+				results[i] <- prepared{inputs, time.Now().UTC(), err}
+			}
+		})
+	}
+	defer func() { cancel(); downloads.Wait() }()
+	for i, src := range ss {
+		var result prepared
+		select {
+		case result = <-results[i]:
+		case <-ctx.Done():
+			return empty, ctx.Err()
+		}
+		if result.err != nil {
+			return empty, fmt.Errorf("%s: %w", src.ID(), result.err)
+		}
+		ins := result.inputs
 		sourceCtx, sourceCancel := context.WithTimeout(ctx, 20*time.Minute)
 		defer sourceCancel()
-		ins, e := source.Prepare(sourceCtx, src, filepath.Join(cache, "raw"))
-		if e != nil {
-			return empty, fmt.Errorf("%s: %w", src.ID(), e)
-		}
-		status := SourceStatus{ID: src.ID(), Inputs: len(ins), CheckedAt: time.Now().UTC()}
+		normalizeStarted := time.Now()
+		log.Printf("normalizing source=%s", src.ID())
+		status := SourceStatus{ID: src.ID(), Inputs: len(ins), CheckedAt: result.checked}
 		revisions := make([]string, 0, len(ins))
 		for _, in := range ins {
 			revisions = append(revisions, in.Digest)
@@ -114,17 +175,49 @@ func compile(ctx context.Context, dir string, ss []source.Source, profile compac
 		rb, _ := json.Marshal(revisions)
 		status.Revision = compactdb.Digest(rb)
 		for _, in := range ins {
+			if in.Kind == source.JammyOVALKind {
+				status.RuleFormats = []string{compactdb.UbuntuJammyOVAL, compactdb.UbuntuJammyPackageOVAL}
+			}
+			if in.Kind == source.VEXKind {
+				status.RuleFormats = []string{compactdb.UbuntuVEX}
+			}
 			if in.Kind == "nvd-gzip" || in.Kind == "nvd" {
-				status.RuleFormats = []string{cpe.RuleFormat}
+				if retain && policyDigest("nvd", previous.ProductPolicy) != policyDigest("nvd", productid.Policy) {
+					for _, prior := range previous.Sources {
+						if !updated[prior.ID] && slices.Contains(prior.RuleFormats, cpe.RuleFormat) {
+							return empty, errors.New("refresh all NVD sources together when product policy changes")
+						}
+					}
+				}
+				summary.ProductPolicy = productid.Policy
+				status.RuleFormats = []string{cpe.RuleFormat, productid.DockerDesktopRuleFormat, productid.ExpandedMacRuleFormat, productid.ExtendedHomebrewRuleFormat, productid.AdditionalProductRuleFormat, productid.DesktopAndLibrariesRuleFormat}
 			}
 			rawPaths = append(rawPaths, in.Path)
 			rawPaths = append(rawPaths, in.Dependencies...)
+			adapterRevision := 0
+			if in.Kind == "nvd-gzip" || in.Kind == "nvd" {
+				adapterRevision = 4
+			}
+			if in.Kind == source.JammyOVALKind {
+				adapterRevision = source.JammyOVALProjectionRevision
+			}
+			if in.Kind == source.VEXKind {
+				adapterRevision = source.VEXProjectionRevision
+			}
+			if src.ID() == "canonical-osv" && in.Kind == "osv-tar-xz" &&
+				(len(in.Kinds) == 0 || slices.Contains(in.Kinds, "usn")) {
+				adapterRevision = 2 // USNs retain Canonical package-scoped CVE mappings.
+				status.RuleFormats = append(status.RuleFormats, compactdb.UbuntuUSN)
+			}
+
 			identity, _ := json.Marshal(struct {
 				Format                     int
 				Profile                    compactdb.Profile
 				Source, Kind, Digest, Link string
 				Kinds                      []string
-			}{projection.Version, profile, src.ID(), in.Kind, in.Digest, in.Link, in.Kinds})
+				ProductPolicyDigest        string `json:",omitempty"`
+				AdapterRevision            int    `json:",omitempty"`
+			}{projection.Version, profile, src.ID(), in.Kind, in.Digest, in.Link, in.Kinds, policyDigest(in.Kind, summary.ProductPolicy), adapterRevision})
 			id := compactdb.Digest(identity)
 			path := filepath.Join(cache, id+".rows")
 			var meta compiled
@@ -198,7 +291,7 @@ func compile(ctx context.Context, dir string, ss []source.Source, profile compac
 		if status.Advisories == 0 {
 			return empty, fmt.Errorf("%s: source has no advisories", src.ID())
 		}
-		log.Printf("source=%s advisories=%d inputs=%d cached=%d", status.ID, status.Advisories, status.Inputs, status.Cached)
+		log.Printf("source=%s advisories=%d inputs=%d cached=%d normalization=%s", status.ID, status.Advisories, status.Inputs, status.Cached, time.Since(normalizeStarted).Round(time.Millisecond))
 		summary.Sources = append(summary.Sources, status)
 		sourceCancel()
 	}
@@ -223,7 +316,10 @@ func compile(ctx context.Context, dir string, ss []source.Source, profile compac
 		}{projection.Version, facts})
 	}
 	summary.Generation = compactdb.Digest(raw)
-	if old, e := Load(dir); e == nil && old.Generation == summary.Generation {
+	buildStarted := time.Now()
+	old, loadErr := Load(dir)
+	if loadErr == nil && old.Generation == summary.Generation {
+		log.Printf("index build duration=%s reused=%d rebuilt=0 removed=0", time.Since(buildStarted).Round(time.Millisecond), len(old.Buckets))
 		old.Sources = summary.Sources
 		if e = atomicfile.JSON(filepath.Join(dir, "catalog.json"), old); e != nil {
 			return empty, e
@@ -307,10 +403,26 @@ func compile(ctx context.Context, dir string, ss []source.Source, profile compac
 			return empty, e
 		}
 	}
-	summary.Buckets, e = b.Finish(ctx, filepath.Join(work, "db"))
+	var reusable []compactdb.Bucket
+	if loadErr == nil && old.Profile == profile {
+		reusable = old.Buckets
+	}
+	var reused int
+	summary.Buckets, reused, e = b.FinishIncremental(ctx, filepath.Join(work, "db"), reusable)
 	if e != nil {
 		return empty, e
 	}
+	activeSlots := map[string]bool{}
+	for _, bucket := range summary.Buckets {
+		activeSlots[bucket.Slot] = true
+	}
+	removed := 0
+	for _, bucket := range reusable {
+		if !activeSlots[bucket.Slot] {
+			removed++
+		}
+	}
+	log.Printf("index build duration=%s reused=%d rebuilt=%d removed=%d", time.Since(buildStarted).Round(time.Millisecond), reused, len(summary.Buckets)-reused, removed)
 	if len(summary.Buckets) == 0 {
 		return empty, errors.New("no compact rows")
 	}
@@ -388,21 +500,27 @@ func replay(ctx context.Context, path string, b *compactdb.Builder) error {
 
 // Sync records failure separately without replacing the last complete catalog.
 func Sync(ctx context.Context, dir string, ss []source.Source, profile compactdb.Profile) (Summary, error) {
-	return syncSources(ctx, dir, ss, profile, false)
+	return SyncWithWorkers(ctx, dir, ss, profile, false, DefaultSourceWorkers)
 }
 
 // SyncSelected refreshes explicit sources while retaining others and their
 // original freshness. It never upgrades old source checked_at timestamps.
 func SyncSelected(ctx context.Context, dir string, ss []source.Source, profile compactdb.Profile) (Summary, error) {
-	return syncSources(ctx, dir, ss, profile, true)
+	return SyncWithWorkers(ctx, dir, ss, profile, true, DefaultSourceWorkers)
 }
-func syncSources(ctx context.Context, dir string, ss []source.Source, profile compactdb.Profile, retain bool) (Summary, error) {
+
+const DefaultSourceWorkers = 3
+
+func SyncWithWorkers(ctx context.Context, dir string, ss []source.Source, profile compactdb.Profile, retain bool, workers int) (Summary, error) {
+	if workers < 1 || workers > 8 {
+		return Summary{}, errors.New("source workers must be between 1 and 8")
+	}
 	unlock, e := filelock.Acquire(ctx, filepath.Join(dir, "sync.lock"), false)
 	if e != nil {
 		return Summary{}, e
 	}
 	defer unlock()
-	s, e := compile(ctx, dir, ss, profile, retain)
+	s, e := compile(ctx, dir, ss, profile, retain, workers)
 	status := struct {
 		OK bool      `json:"ok"`
 		At time.Time `json:"at"`
@@ -526,4 +644,12 @@ func cacheSource(path string) string {
 		return ""
 	}
 	return row.Source
+}
+
+func policyDigest(kind string, policy *snapshot.ProductPolicy) string {
+	if kind != "nvd" && kind != "nvd-gzip" {
+		return ""
+	}
+	raw, _ := json.Marshal(policy)
+	return compactdb.Digest(raw)
 }

@@ -22,20 +22,21 @@ const (
 // Snapshot is one collection pass. Coverage is always present; an empty
 // package list is not evidence that the host has no packages.
 type Snapshot struct {
-	RunningKernel    *Kernel       `json:"running_kernel,omitempty"`
-	FormatVersion    int           `json:"format_version"`
-	Collector        string        `json:"collector"`
-	CollectorVersion string        `json:"collector_version"`
-	CollectedAt      time.Time     `json:"collected_at"`
-	Host             Host          `json:"host"`
-	Packages         []Package     `json:"packages,omitempty"`
-	Services         []Service     `json:"services,omitempty"`
-	Processes        []string      `json:"processes,omitempty"`
-	Listeners        []Listener    `json:"listeners,omitempty"`
-	Applications     []Application `json:"applications,omitempty"`
-	Containers       []Container   `json:"containers,omitempty"`
-	Dependencies     []Dependency  `json:"dependencies,omitempty"`
-	Coverage         []Note        `json:"coverage"`
+	RunningKernel    *Kernel           `json:"running_kernel,omitempty"`
+	FormatVersion    int               `json:"format_version"`
+	Collector        string            `json:"collector"`
+	CollectorVersion string            `json:"collector_version"`
+	CollectedAt      time.Time         `json:"collected_at"`
+	Host             Host              `json:"host"`
+	Packages         []Package         `json:"packages,omitempty"`
+	Services         []Service         `json:"services,omitempty"`
+	Processes        []string          `json:"processes,omitempty"`
+	Listeners        []Listener        `json:"listeners,omitempty"`
+	Applications     []Application     `json:"applications,omitempty"`
+	Firewall         []FirewallVerdict `json:"firewall,omitempty"`
+	Containers       []Container       `json:"containers,omitempty"`
+	Dependencies     []Dependency      `json:"dependencies,omitempty"`
+	Coverage         []Note            `json:"coverage"`
 }
 
 // Host is identity that is useful for version matching. It has no hostname.
@@ -48,6 +49,7 @@ type Host struct {
 }
 
 type Package struct {
+	HomebrewBottle  string `json:"homebrew_bottle,omitempty"`
 	UpstreamVersion string `json:"upstream_version,omitempty"`
 	Provenance      string `json:"provenance,omitempty"`
 	Manager         string `json:"manager"`
@@ -68,6 +70,7 @@ type Service struct {
 }
 
 type Listener struct {
+	BindAddress  string `json:"bind_address,omitempty"`
 	Service      string `json:"service,omitempty"`
 	Family       string `json:"family"`
 	Protocol     string `json:"protocol"`
@@ -88,19 +91,22 @@ type Application struct {
 }
 
 type Container struct {
-	Name         string          `json:"name"`
-	Image        string          `json:"image,omitempty"`
-	ImageID      string          `json:"image_id,omitempty"`
-	Digest       string          `json:"digest,omitempty"`
-	OS           string          `json:"os,omitempty"`
-	Architecture string          `json:"architecture,omitempty"`
-	StartedAt    string          `json:"started_at,omitempty"`
-	Packages     []Package       `json:"packages,omitempty"`
-	Applications []Application   `json:"applications,omitempty"`
-	Ports        []PublishedPort `json:"ports,omitempty"`
+	ID           string            `json:"id,omitempty"`
+	Release      map[string]string `json:"release,omitempty"`
+	Name         string            `json:"name"`
+	Image        string            `json:"image,omitempty"`
+	ImageID      string            `json:"image_id,omitempty"`
+	Digest       string            `json:"digest,omitempty"`
+	OS           string            `json:"os,omitempty"`
+	Architecture string            `json:"architecture,omitempty"`
+	StartedAt    string            `json:"started_at,omitempty"`
+	Packages     []Package         `json:"packages,omitempty"`
+	Applications []Application     `json:"applications,omitempty"`
+	Ports        []PublishedPort   `json:"ports,omitempty"`
 }
 
 type PublishedPort struct {
+	BindAddress   string `json:"bind_address,omitempty"`
 	Family        string `json:"family"`
 	Protocol      string `json:"protocol"`
 	HostPort      int    `json:"host_port,omitempty"`
@@ -108,6 +114,19 @@ type PublishedPort struct {
 	ContainerPort string `json:"container_port,omitempty"`
 	Evidence      string `json:"evidence,omitempty"`
 	Reachability  string `json:"reachability,omitempty"`
+}
+
+type FirewallVerdict struct {
+	Interface   string `json:"interface,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	Protocol    string `json:"protocol"`
+	Port        int    `json:"port"`
+	Family      string `json:"family"`
+	SourceFirst string `json:"source_first,omitempty"`
+	SourceLast  string `json:"source_last,omitempty"`
+	Status      string `json:"status"`
+	Path        string `json:"path,omitempty"`
+	Reason      string `json:"reason"`
 }
 
 type Dependency struct {
@@ -144,12 +163,13 @@ func (s Snapshot) Validate() error {
 
 // Kernel separates the loaded source version from installed image package metadata.
 type Kernel struct {
-	Release                string `json:"release"`
-	Package                string `json:"package,omitempty"`
-	SourceName             string `json:"source_name,omitempty"`
-	SourceVersion          string `json:"running_source_version,omitempty"`
-	InstalledSourceVersion string `json:"installed_source_version,omitempty"`
-	Status                 string `json:"status"`
-	RebootRequired         bool   `json:"reboot_required"`
-	Detail                 string `json:"detail,omitempty"`
+	RebootPackages         []string `json:"reboot_packages,omitempty"`
+	Release                string   `json:"release"`
+	Package                string   `json:"package,omitempty"`
+	SourceName             string   `json:"source_name,omitempty"`
+	SourceVersion          string   `json:"running_source_version,omitempty"`
+	InstalledSourceVersion string   `json:"installed_source_version,omitempty"`
+	Status                 string   `json:"status"`
+	RebootRequired         bool     `json:"reboot_required"`
+	Detail                 string   `json:"detail,omitempty"`
 }

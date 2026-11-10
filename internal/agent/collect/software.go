@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -106,6 +107,39 @@ func parseDPKG(text string) ([]inventory.Package, error) {
 	}
 	return out, nil
 }
+
+// HomebrewFormulaSnapshot inventories only the installed kegs of one formula.
+func HomebrewFormulaSnapshot(prefix, name string) (inventory.Snapshot, error) {
+	var snapshot inventory.Snapshot
+	snapshot.Host.OS = "darwin"
+	if (prefix != "/opt/homebrew" && prefix != "/usr/local") || name == "" ||
+		strings.HasPrefix(name, "-") || name == "." || name == ".." || filepath.Base(name) != name {
+		return snapshot, fmt.Errorf("invalid Homebrew formula or prefix")
+	}
+	cellar := filepath.Join(prefix, "Cellar")
+	entries, err := os.ReadDir(filepath.Join(cellar, name))
+	if err != nil {
+		return snapshot, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		provenance, version, bottle := brewReceipt(cellar, name, entry.Name())
+		if provenance != "homebrew/core" || version == "" {
+			return snapshot, fmt.Errorf("cannot verify Homebrew receipt for %s", entry.Name())
+		}
+		snapshot.Packages = append(snapshot.Packages, inventory.Package{
+			Manager: "homebrew-formula", Name: name, Version: entry.Name(), Status: "installed",
+			Provenance: provenance, UpstreamVersion: version, HomebrewBottle: bottle,
+		})
+	}
+	if len(snapshot.Packages) == 0 {
+		return snapshot, fmt.Errorf("no installed Homebrew kegs found")
+	}
+	return snapshot, nil
+}
+
 func (h Host) brew(ctx context.Context, s *inventory.Snapshot) {
 	cellar := ""
 	if raw, err := h.commandLimit(ctx, 4096, "brew", "--cellar"); err == nil {
@@ -133,7 +167,7 @@ func (h Host) brew(ctx context.Context, s *inventory.Snapshot) {
 				}
 				p := inventory.Package{Manager: "homebrew-" + kind, Name: f[0], Version: v, Status: "installed"}
 				if kind == "formula" && cellar != "" {
-					p.Provenance, p.UpstreamVersion = brewReceipt(cellar, f[0], v)
+					p.Provenance, p.UpstreamVersion, p.HomebrewBottle = brewReceipt(cellar, f[0], v)
 				}
 				s.Packages = append(s.Packages, p)
 			}
@@ -142,10 +176,17 @@ func (h Host) brew(ctx context.Context, s *inventory.Snapshot) {
 }
 func (h Host) applications(ctx context.Context, s *inventory.Snapshot) {
 	dirs := []string{"/Applications", "/System/Applications"}
-	if home, err := os.UserHomeDir(); err == nil {
+	home, err := os.UserHomeDir()
+	if err == nil {
 		dirs = append(dirs, filepath.Join(home, "Applications"))
+	} else {
+		home = ""
 	}
 	h.applicationDirs(ctx, s, dirs)
+	if home != "" {
+		h.launchedApplications(ctx, s, home)
+	}
+	s.AddNote(inventory.NotChecked, "application-scope", "only /Applications, /System/Applications and user Applications (one category level) are walked; apps this account has opened elsewhere are added from Spotlight. Copies in Library, node_modules, DerivedData and dist, and other volumes, are not treated as installed applications")
 }
 func (h Host) applicationDirs(ctx context.Context, s *inventory.Snapshot, dirs []string) {
 	inspected := 0
@@ -172,30 +213,16 @@ func (h Host) applicationDirs(ctx context.Context, s *inventory.Snapshot, dirs [
 					s.AddNote(inventory.Truncated, "applications", "application bundle limit reached")
 					return filepath.SkipAll
 				}
-				data, e := h.commandLimit(ctx, 1<<20, "plutil", "-convert", "json", "-o", "-", filepath.Join(path, "Contents", "Info.plist"))
-				var p struct {
-					Name    string `json:"CFBundleName"`
-					ID      string `json:"CFBundleIdentifier"`
-					Version string `json:"CFBundleShortVersionString"`
-					Build   string `json:"CFBundleVersion"`
-				}
-				if e != nil || json.Unmarshal(data, &p) != nil {
-					s.AddNote(inventory.Unavailable, "applications", "an application plist could not be parsed")
+				app, e := h.readApplication(ctx, path, d.Name())
+				if e != nil {
+					detail := "an application plist could not be parsed"
+					if errors.Is(e, errApplicationMetadata) {
+						detail = "application metadata exceeds field limits"
+					}
+					s.AddNote(inventory.Unavailable, "applications", detail)
 					return filepath.SkipDir
 				}
-				if len(p.Name) > 512 || len(p.ID) > 512 || len(p.Version) > 512 || len(p.Build) > 512 {
-					s.AddNote(inventory.Unavailable, "applications", "application metadata exceeds field limits")
-					return filepath.SkipDir
-				}
-				kind := "release"
-				if p.Version == "" {
-					p.Version = p.Build
-					kind = "build"
-				}
-				if p.Name == "" {
-					p.Name = strings.TrimSuffix(d.Name(), ".app")
-				}
-				s.Applications = append(s.Applications, inventory.Application{Name: p.Name, Version: p.Version, Identifier: p.ID, VersionKind: kind})
+				s.Applications = append(s.Applications, app)
 				return filepath.SkipDir
 			}
 			rel, _ := filepath.Rel(root, path)
@@ -208,25 +235,165 @@ func (h Host) applicationDirs(ctx context.Context, s *inventory.Snapshot, dirs [
 			s.AddNote(inventory.Unavailable, "applications", "application enumeration failed")
 		}
 	}
-	s.AddNote(inventory.NotChecked, "application-scope", "only /Applications, /System/Applications and user Applications (one category level) were inspected; nested and other volumes excluded")
+}
+
+var errApplicationMetadata = errors.New("application metadata exceeds field limits")
+
+type bundleInfo struct {
+	Name    string `json:"CFBundleName"`
+	ID      string `json:"CFBundleIdentifier"`
+	Version string `json:"CFBundleShortVersionString"`
+	Build   string `json:"CFBundleVersion"`
+}
+
+func (h Host) readApplication(ctx context.Context, path, filename string) (inventory.Application, error) {
+	data, err := h.commandLimit(ctx, 1<<20, "plutil", "-convert", "json", "-o", "-", filepath.Join(path, "Contents", "Info.plist"))
+	var info bundleInfo
+	if err != nil || json.Unmarshal(data, &info) != nil {
+		return inventory.Application{}, errors.New("application plist could not be parsed")
+	}
+	if len(info.Name) > 512 || len(info.ID) > 512 || len(info.Version) > 512 || len(info.Build) > 512 {
+		return inventory.Application{}, errApplicationMetadata
+	}
+	kind := "release"
+	version := info.Version
+	if version == "" {
+		version = info.Build
+		kind = "build"
+	}
+	name := info.Name
+	if name == "" {
+		name = strings.TrimSuffix(filename, ".app")
+	}
+	return inventory.Application{Name: name, Version: version, Identifier: info.ID, VersionKind: kind}, nil
+}
+
+// launchedApplications adds bundles the account has actually opened that live
+// outside the walked folders. A preferences file is the evidence of a launch.
+// Build trees and nested helpers are left out so a source checkout is not an install.
+func (h Host) launchedApplications(ctx context.Context, s *inventory.Snapshot, home string) {
+	out, err := h.commandLimit(ctx, 2<<20, "mdfind", "kMDItemContentTypeTree == 'com.apple.application-bundle'")
+	if err != nil {
+		s.AddNote(inventory.Unavailable, "applications", "apps outside the standard folders could not be listed")
+		return
+	}
+	known := map[string]struct{}{}
+	for _, app := range s.Applications {
+		if app.Identifier != "" {
+			known[app.Identifier] = struct{}{}
+		}
+	}
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(string(out), "\n") {
+		path := applicationBundlePath(line)
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		if skippedApplicationPath(path, home) {
+			continue
+		}
+		if len(s.Applications) >= maxApplications {
+			s.AddNote(inventory.Truncated, "applications", "application bundle limit reached")
+			return
+		}
+		app, e := h.readApplication(ctx, path, filepath.Base(path))
+		if e != nil || !validBundleID(app.Identifier) {
+			continue
+		}
+		if _, ok := known[app.Identifier]; ok {
+			continue
+		}
+		prefs := filepath.Join(home, "Library", "Preferences", app.Identifier+".plist")
+		info, statErr := os.Stat(prefs)
+		if statErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		known[app.Identifier] = struct{}{}
+		s.Applications = append(s.Applications, app)
+	}
+}
+
+func applicationBundlePath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	idx := strings.Index(raw, ".app")
+	if idx < 0 || !strings.HasPrefix(raw, "/") {
+		return ""
+	}
+	end := idx + len(".app")
+	if end != len(raw) && raw[end] != '/' {
+		return ""
+	}
+	path := filepath.Clean(raw[:end])
+	if strings.Contains(path, "..") || strings.Count(path, ".app") != 1 {
+		return ""
+	}
+	return path
+}
+
+func skippedApplicationPath(path, home string) bool {
+	for _, root := range []string{"/Applications/", "/System/"} {
+		if strings.HasPrefix(path, root) {
+			return true
+		}
+	}
+	if home != "" && strings.HasPrefix(path, filepath.Clean(home)+"/Applications/") {
+		return true
+	}
+	if strings.Contains(path, ".framework/") {
+		return true
+	}
+	switch {
+	case strings.Contains(path, "/Library/"),
+		strings.Contains(path, "/node_modules/"),
+		strings.Contains(path, "/DerivedData/"),
+		strings.Contains(path, "/dist/"):
+		return true
+	default:
+		return false
+	}
+}
+
+func validBundleID(id string) bool {
+	if len(id) < 3 || len(id) > 200 {
+		return false
+	}
+	for i, r := range id {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case (r == '.' || r == '-') && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Trust the installed receipt, not the current remote formula metadata. Source
 // version excludes Homebrew revisions; HEAD/custom taps never map implicitly.
-func brewReceipt(cellar, name, version string) (string, string) {
+func brewReceipt(cellar, name, version string) (string, string, string) {
 	if filepath.Base(name) != name || filepath.Base(version) != version || name == "." || version == "." {
-		return "", ""
+		return "", "", ""
 	}
 	f, err := os.Open(filepath.Join(cellar, name, version, "INSTALL_RECEIPT.json"))
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	defer f.Close()
 	raw, err := io.ReadAll(io.LimitReader(f, 1<<20))
 	if err != nil || len(raw) >= 1<<20 {
-		return "", ""
+		return "", "", ""
 	}
 	var r struct {
+		PouredFromBottle bool `json:"poured_from_bottle"`
+		BuiltAsBottle    bool `json:"built_as_bottle"`
+		Arch             string
+		BuiltOn          struct {
+			OSVersion string `json:"os_version"`
+		} `json:"built_on"`
 		Source struct {
 			Tap      string
 			Spec     string
@@ -234,14 +401,19 @@ func brewReceipt(cellar, name, version string) (string, string) {
 		}
 	}
 	if json.Unmarshal(raw, &r) != nil || r.Source.Spec != "stable" || r.Source.Tap != "homebrew/core" || len(r.Source.Versions.Stable) > 512 {
-		return "", ""
+		return "", "", ""
 	}
 	stable := r.Source.Versions.Stable
 	if version != stable {
 		suffix, ok := strings.CutPrefix(version, stable+"_")
 		if !ok || suffix == "" || strings.Trim(suffix, "0123456789") != "" {
-			return "", ""
+			return "", "", ""
 		}
 	}
-	return r.Source.Tap, stable
+	bottle := ""
+	if r.PouredFromBottle && r.BuiltAsBottle && r.Arch == "arm64" &&
+		(r.BuiltOn.OSVersion == "macOS 27" || r.BuiltOn.OSVersion == "macOS 27.0") {
+		bottle = "arm64_golden_gate"
+	}
+	return r.Source.Tap, stable, bottle
 }

@@ -10,8 +10,8 @@ import (
 
 // Resident updates the shared database and repeatedly produces full local scan
 // reports. Startup update precedes the first scan; later loops are independent.
-// Failed downloads retry within a minute; successful updates request a new scan.
-func Resident(ctx context.Context, update, scan func(context.Context) error, updateEvery, scanEvery time.Duration, logger *log.Logger) error {
+// Failed downloads retry within a minute; changed content requests a new scan.
+func Resident(ctx context.Context, update func(context.Context) (bool, error), scan func(context.Context) error, updateEvery, scanEvery time.Duration, logger *log.Logger) error {
 	if scan == nil || scanEvery < time.Second || update != nil && updateEvery < time.Second {
 		return errors.New("resident: tasks/intervals invalid")
 	}
@@ -33,7 +33,7 @@ func Resident(ctx context.Context, update, scan func(context.Context) error, upd
 	}
 	var initialErr error
 	if update != nil {
-		initialErr = invoke("database", update)
+		initialErr = invoke("database", func(ctx context.Context) error { _, err := update(ctx); return err })
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -74,11 +74,16 @@ func Resident(ctx context.Context, update, scan func(context.Context) error, upd
 				case <-ctx.Done():
 					return
 				case <-timer.C:
-					err := invoke("database", update)
+					changed, err := update(ctx)
+					if err != nil && ctx.Err() == nil {
+						logger.Printf("database: %v", err)
+					} else if changed {
+						logger.Print("database: changed; requesting scan")
+					}
 					delay = updateEvery
 					if err != nil {
 						delay = min(updateEvery, time.Minute)
-					} else {
+					} else if changed {
 						select {
 						case requests <- struct{}{}:
 						default:

@@ -1,6 +1,8 @@
 package publish
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -59,7 +61,17 @@ func Artifacts(dir string) http.Handler {
 			return
 		}
 		if name == "manifest.json" {
+			raw, err := io.ReadAll(io.LimitReader(f, snapshot.MaxManifest+1))
+			if err != nil || len(raw) > snapshot.MaxManifest {
+				http.Error(w, "manifest unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("ETag", snapshot.ManifestETag(raw))
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			http.ServeContent(w, r, name, info.ModTime(), bytes.NewReader(raw))
+			return
 		} else {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		}

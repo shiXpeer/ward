@@ -20,8 +20,16 @@ import (
 	"shixpeer.com/ward/internal/filelock"
 	"shixpeer.com/ward/internal/netpolicy"
 	"shixpeer.com/ward/internal/snapshot"
+	"slices"
 	"time"
 )
+
+type Progress struct {
+	Stage     string `json:"stage"`
+	Component string `json:"component,omitempty"`
+	Done      int64  `json:"done"`
+	Total     int64  `json:"total"`
+}
 
 type Client struct {
 	URL, Dir     string
@@ -29,8 +37,10 @@ type Client struct {
 	TrustedKey   ed25519.PublicKey
 	AllowedHosts []string
 	Now          func() time.Time
+	OnProgress   func(Progress)
 }
 type Result struct {
+	Changed       bool              `json:"changed"`
 	Revision      int64             `json:"revision"`
 	Objects       int               `json:"objects"`
 	Downloaded    int               `json:"downloaded"`
@@ -71,6 +81,14 @@ func current(dir string, key ed25519.PublicKey, fresh bool, now time.Time) (poin
 	return p, m, e
 }
 func (c *Client) Update(ctx context.Context) (Result, error) {
+	return c.update(ctx, false)
+}
+
+// Poll checks the signed manifest without touching installed objects on a no-op.
+func (c *Client) Poll(ctx context.Context) (Result, error) {
+	return c.update(ctx, true)
+}
+func (c *Client) update(ctx context.Context, poll bool) (Result, error) {
 	var result Result
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
@@ -109,9 +127,30 @@ func (c *Client) Update(ctx context.Context) (Result, error) {
 		return netpolicy.URL(r.URL.String(), hosts)
 	}
 	defer hc.CloseIdleConnections()
-	resp, e := request(ctx, &hc, c.URL, snapshot.MaxManifest)
+	old, previous, e := current(c.Dir, c.TrustedKey, false, c.now())
+	if e != nil && !errors.Is(e, os.ErrNotExist) {
+		return result, e
+	}
+	etag := ""
+	if poll && previous.ExpiresAt.After(c.now()) && !previous.CreatedAt.After(c.now().Add(5*time.Minute)) {
+		etag = snapshot.ManifestETag(old.Envelope)
+	}
+	emit := func(p Progress) {
+		if c.OnProgress != nil {
+			c.OnProgress(p)
+		}
+	}
+	emit(Progress{Stage: "manifest"})
+	resp, e := request(ctx, &hc, c.URL, snapshot.MaxManifest, etag)
 	if e != nil {
 		return result, e
+	}
+	if resp.StatusCode == http.StatusNotModified {
+		resp.Body.Close()
+		if _, err := snapshot.Verify(old.Envelope, c.TrustedKey, c.now()); err != nil {
+			return result, err
+		}
+		return resultFor(previous), nil
 	}
 	raw, e := io.ReadAll(io.LimitReader(resp.Body, snapshot.MaxManifest+1))
 	resp.Body.Close()
@@ -122,15 +161,15 @@ func (c *Client) Update(ctx context.Context) (Result, error) {
 	if e != nil {
 		return result, e
 	}
-	old, previous, e := current(c.Dir, c.TrustedKey, false, c.now())
-	if e != nil && !errors.Is(e, os.ErrNotExist) {
-		return result, e
-	}
+
 	if m.Revision < previous.Revision || (m.Revision == previous.Revision && snapshot.PayloadDigest(old.Envelope) != snapshot.PayloadDigest(raw)) {
 		return result, errors.New("rollback or conflicting snapshot revision rejected")
 	}
 	if previous.Profile != "" && previous.Profile != m.Profile {
 		return result, errors.New("publication profile changed; use a separate state directory")
+	}
+	if poll && m.Revision == previous.Revision {
+		return resultFor(m), nil
 	}
 	base := u
 	if m.BaseURL != "" {
@@ -156,6 +195,10 @@ func (c *Client) Update(ctx context.Context) (Result, error) {
 	if e != nil {
 		return result, e
 	}
+	emit(Progress{Stage: "planning"})
+	var pending []snapshot.Object
+	var total int64
+	queued := make(map[string]int64)
 	for _, obj := range m.Objects {
 		result.DatabaseBytes += obj.Bytes
 		dest := filepath.Join(objects, obj.SHA256+".wdb")
@@ -166,16 +209,39 @@ func (c *Client) Update(ctx context.Context) (Result, error) {
 				continue
 			}
 		}
+		if queued[obj.SHA256] == obj.Bytes {
+			continue
+		}
+		queued[obj.SHA256] = obj.Bytes
+		pending = append(pending, obj)
+		total += obj.Bytes
+	}
+	for _, obj := range pending {
+		dest := filepath.Join(objects, obj.SHA256+".wdb")
 		target := base.ResolveReference(&url.URL{Path: obj.Name()}).String()
 		if e = netpolicy.URL(target, hosts); e != nil {
 			return result, e
 		}
-		if e = install(ctx, &hc, target, dest, obj); e != nil {
+		var progress func(int64)
+		if c.OnProgress != nil {
+			p := Progress{Stage: "download", Component: obj.Slot, Done: result.WireBytes, Total: total}
+			emit(p)
+			last := time.Now()
+			progress = func(n int64) {
+				if n >= obj.Bytes || time.Since(last) >= 200*time.Millisecond {
+					p.Done = result.WireBytes + min(n, obj.Bytes)
+					emit(p)
+					last = time.Now()
+				}
+			}
+		}
+		if e = install(ctx, &hc, target, dest, obj, progress); e != nil {
 			return result, fmt.Errorf("object %s: %w", obj.Slot, e)
 		}
 		result.Downloaded++
 		result.WireBytes += obj.Bytes
 	}
+	emit(Progress{Stage: "install", Done: result.WireBytes, Total: total})
 	// Persist object-directory renames before persisting a pointer to those files.
 	disk, e := os.Open(objects)
 	if e != nil {
@@ -203,20 +269,35 @@ func (c *Client) Update(ctx context.Context) (Result, error) {
 	// Readers hold active.lock shared; obsolete objects can now be removed safely.
 	_ = prune(objects, m.Objects, nil)
 
+	result.Changed = result.Downloaded > 0 || !slices.Equal(previous.Objects, m.Objects)
 	result.Revision = m.Revision
 	result.Objects = len(m.Objects)
 	result.Profile = m.Profile
 	return result, nil
 }
-func request(ctx context.Context, h *http.Client, target string, max int64) (*http.Response, error) {
+func resultFor(m snapshot.Manifest) Result {
+	r := Result{Revision: m.Revision, Objects: len(m.Objects), Profile: m.Profile}
+	for _, o := range m.Objects {
+		r.DatabaseBytes += o.Bytes
+	}
+	return r
+}
+
+func request(ctx context.Context, h *http.Client, target string, max int64, etag string) (*http.Response, error) {
 	req, e := http.NewRequestWithContext(ctx, "GET", target, nil)
 	if e != nil {
 		return nil, e
 	}
 	req.Header.Set("Accept-Encoding", "identity")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
 	resp, e := h.Do(req)
 	if e != nil {
 		return nil, errors.New("snapshot HTTPS request failed")
+	}
+	if resp.StatusCode == http.StatusNotModified && etag != "" && resp.Header.Get("ETag") == etag {
+		return resp, nil
 	}
 	if resp.StatusCode != 200 || resp.ContentLength > max {
 		resp.Body.Close()
@@ -224,8 +305,20 @@ func request(ctx context.Context, h *http.Client, target string, max int64) (*ht
 	}
 	return resp, nil
 }
-func install(ctx context.Context, h *http.Client, target, dest string, o snapshot.Object) error {
-	resp, e := request(ctx, h, target, o.Bytes)
+
+type downloadCounter struct {
+	bytes    int64
+	progress func(int64)
+}
+
+func (c *downloadCounter) Write(p []byte) (int, error) {
+	c.bytes += int64(len(p))
+	c.progress(c.bytes)
+	return len(p), nil
+}
+
+func install(ctx context.Context, h *http.Client, target, dest string, o snapshot.Object, progress func(int64)) error {
+	resp, e := request(ctx, h, target, o.Bytes, "")
 	if e != nil {
 		return e
 	}
@@ -237,7 +330,11 @@ func install(ctx context.Context, h *http.Client, target, dest string, o snapsho
 	defer temp.Close()
 	defer os.Remove(temp.Name())
 	digest := sha256.New()
-	n, e := io.CopyBuffer(io.MultiWriter(temp, digest), io.LimitReader(resp.Body, o.Bytes+1), make([]byte, 32<<10))
+	writers := []io.Writer{temp, digest}
+	if progress != nil {
+		writers = append(writers, &downloadCounter{progress: progress})
+	}
+	n, e := io.CopyBuffer(io.MultiWriter(writers...), io.LimitReader(resp.Body, o.Bytes+1), make([]byte, 32<<10))
 	if e != nil {
 		return e
 	}

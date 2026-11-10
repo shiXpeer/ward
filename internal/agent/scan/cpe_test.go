@@ -45,8 +45,8 @@ func TestIdentitiesRequireReceiptOrBundleID(t *testing.T) {
 		{Manager: "homebrew-formula", Name: "curl", Version: "8.0_1", Provenance: "homebrew/core", UpstreamVersion: "8.0"},
 		{Manager: "homebrew-formula", Name: "curl", Version: "8.0_1", Provenance: "custom/tap", UpstreamVersion: "8.0"},
 	}, Applications: []inventory.Application{{Name: "Renamed Browser", Identifier: "com.google.Chrome", Version: "120.0.1.2", VersionKind: "release"}, {Name: "Google Chrome", Identifier: "other.app", Version: "120.0.1.2"}}}
-	c := components(s)
-	if len(c) != 4 || c[0].Product != productid.Formula["curl"] || c[0].MatchVersion != "8.0" || c[1].Ecosystem != "" || c[2].Product != productid.Bundle["com.google.Chrome"] || c[3].Ecosystem != "" {
+	c := components(s, productid.Policy)
+	if len(c) != 4 || c[0].Product != productid.Policy.Formula["curl"] || c[0].MatchVersion != "8.0" || c[1].Ecosystem != "" || c[2].Product != productid.Policy.Bundle["com.google.Chrome"] || c[3].Ecosystem != "" {
 		t.Fatal(c)
 	}
 }
@@ -66,8 +66,34 @@ func TestComplexOldVersionsCanBeExcludedButNegationCannot(t *testing.T) {
 
 func TestBundleBuildNumberDoesNotBecomeReleaseVersion(t *testing.T) {
 	s := inventory.Snapshot{Applications: []inventory.Application{{Name: "Browser", Identifier: "com.google.Chrome", Version: "999999", VersionKind: "build"}}}
-	c := components(s)
+	c := components(s, productid.Policy)
 	if len(c) != 1 || c[0].Ecosystem != "" || c[0].Product != "" || c[0].Reason == "" {
 		t.Fatal(c)
+	}
+}
+
+func TestAuditedNVDCorrections(t *testing.T) {
+	for _, tc := range []struct {
+		product, id, origin, name, installed, upstream, platform, bottle string
+		excluded                                                         bool
+	}{
+		{"a:libssh2:libssh2", "CVE-2026-55200", "homebrew-formula", "libssh2", "1.11.1_7", "1.11.1", "darwin", "", true},
+		{"a:libssh2:libssh2", "CVE-2026-55200", "homebrew-formula", "libssh2", "1.11.1_6", "1.11.1", "darwin", "", false},
+		{"a:libssh2:libssh2", "CVE-2026-55200", "dpkg", "libssh2", "1.11.1_7", "1.11.1", "linux", "", false},
+		{"a:python:python", "CVE-2026-4519", "homebrew-formula", "python@3.11", "3.11.16", "3.11.16", "darwin", "", true},
+		{"a:python:python", "CVE-2026-4519", "homebrew-formula", "python@3.11", "3.11.15", "3.11.15", "darwin", "", false},
+		{"a:python:python", "CVE-2026-4519", "homebrew-formula", "python@3.13", "3.13.12", "3.13.12", "darwin", "", false},
+		{"a:python:python", "CVE-2026-7210", "homebrew-formula", "python@3.11", "3.11.18", "3.11.18", "darwin", "", false},
+		{"a:python:python", "CVE-2026-3087", "homebrew-formula", "python@3.11", "3.11.15", "3.11.15", "darwin", "", true},
+		{"a:ffmpeg:ffmpeg", "CVE-2025-25468", "homebrew-formula", "ffmpeg", "9.0.2_1", "9.0.2", "darwin", "", true},
+		{"a:ffmpeg:ffmpeg", "CVE-2026-107675", "homebrew-formula", "ffmpeg", "9.0.2_1", "9.0.2", "darwin", "", false},
+		{"a:ffmpeg:ffmpeg", "CVE-2026-107675", "homebrew-formula", "ffmpeg", "9.0.2_1", "9.0.2", "darwin", "arm64_golden_gate", true},
+		{"a:gnu:wget", "CVE-2026-58469", "homebrew-formula", "wget", "1.25.0_2", "1.25.0", "darwin", "", false},
+		{"a:gnu:wget", "CVE-2026-58469", "homebrew-formula", "wget", "1.25.0_2", "1.25.0", "darwin", "arm64_golden_gate", true},
+	} {
+		row := compactdb.Row{Source: "nvd", Package: tc.product, ID: tc.id}
+		if got := correctedNVDMatch(productid.Policy, row, tc.origin, tc.name, tc.installed, tc.upstream, tc.platform, tc.bottle); got != tc.excluded {
+			t.Errorf("%s on %s %s: excluded=%t, want %t", tc.id, tc.name, tc.installed, got, tc.excluded)
+		}
 	}
 }

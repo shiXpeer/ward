@@ -74,12 +74,12 @@ func TestCoreReceiptDoesNotTrustForkOrHead(t *testing.T) {
 	for _, tc := range []struct{ tap, spec, want string }{{"homebrew/core", "stable", "8.0"}, {"custom/tap", "stable", ""}, {"homebrew/core", "head", ""}} {
 		raw := `{"source":{"tap":"` + tc.tap + `","spec":"` + tc.spec + `","versions":{"stable":"8.0"}}}`
 		os.WriteFile(filepath.Join(path, "INSTALL_RECEIPT.json"), []byte(raw), 0600)
-		_, version := brewReceipt(root, "curl", "8.0_1")
+		_, version, _ := brewReceipt(root, "curl", "8.0_1")
 		if version != tc.want {
 			t.Fatal(tc, version)
 		}
 	}
-	if _, version := brewReceipt(root, "../../secret", "x"); version != "" {
+	if _, version, _ := brewReceipt(root, "../../secret", "x"); version != "" {
 		t.Fatal("path traversal accepted")
 	}
 }

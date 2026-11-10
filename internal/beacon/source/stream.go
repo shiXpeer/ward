@@ -52,10 +52,15 @@ func streamOSVTar(ctx context.Context, r io.Reader, kinds []string, emit func(Ad
 				continue
 			}
 		}
-		if h.Size < 1 || h.Size > maxEntry {
-			return errors.New("OSV tar entry limit exceeded")
+		limit := int64(maxEntry)
+		if strings.HasPrefix(h.Name, "osv/usn/") {
+			// Canonical notices can repeat large per-release binary package lists.
+			limit = 16 << 20
 		}
-		b, e := io.ReadAll(io.LimitReader(tr, maxEntry+1))
+		if h.Size < 1 || h.Size > limit {
+			return fmt.Errorf("OSV tar entry limit exceeded: %s (%d bytes, limit %d)", h.Name, h.Size, limit)
+		}
+		b, e := io.ReadAll(io.LimitReader(tr, limit+1))
 		if e != nil {
 			return e
 		}

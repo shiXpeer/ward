@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"shixpeer.com/ward/pkg/vuln"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -22,6 +23,7 @@ const GroupCount = 4
 var Groups = []string{"p", "v", "r", "s"}
 
 type Row struct {
+	Summary        string          `json:"summary,omitempty"`
 	Source         string          `json:"source"`
 	ID             string          `json:"id"`
 	Aliases        []string        `json:"aliases,omitempty"`
@@ -55,8 +57,23 @@ func (p Profile) Validate() error {
 	return nil
 }
 func (p Profile) Accept(eco string) bool {
-	return p == All || eco == "Ubuntu:24.04:LTS" || eco == "Debian:bookworm" || eco == "Debian:12" || eco == "macOS"
+	return p == All || eco == UbuntuVEX || eco == "Ubuntu:24.04:LTS" || eco == "Debian:bookworm" || eco == "Debian:12" || eco == "macOS"
 }
+
+const UbuntuVEX = "Ubuntu:VEX"
+const UbuntuUSN = "Ubuntu:USN"
+const UbuntuJammyPackageOVAL = "Ubuntu:Jammy:PackageOVAL"
+const UbuntuJammyOVAL = "Ubuntu:Jammy:OVAL"
+
+func VEXProduct(name, version, distro string) string {
+	for _, field := range []string{name, version, distro} {
+		if field == "" || len(field) > 256 || strings.ContainsAny(field, "\x00\r\n\t @/?#") {
+			return ""
+		}
+	}
+	return name + "@" + version + "/" + distro
+}
+
 func PackageKey(eco, pkg string) string  { return eco + "\x00" + pkg }
 func KeyHash(group, key string) [32]byte { return sha256.Sum256([]byte(group + "\x00" + key)) }
 func Slot(group, key string) string {

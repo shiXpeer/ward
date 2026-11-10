@@ -99,9 +99,24 @@ func TestStreamInstallIncrementalLookupAndTamper(t *testing.T) {
 	data[len(data)/2] ^= 1
 	os.WriteFile(path, data, 0644)
 	requests.Store(0)
+	var progress []Progress
+	c.OnProgress = func(event Progress) { progress = append(progress, event) }
 	result, e = c.Update(ctx)
 	if e != nil || result.Downloaded != 1 || requests.Load() != 1 {
 		t.Fatal(result, e, requests.Load())
+	}
+	if len(progress) < 5 || progress[0].Stage != "manifest" || progress[1].Stage != "planning" {
+		t.Fatalf("unexpected update stages: %+v", progress)
+	}
+	for _, event := range progress[2 : len(progress)-1] {
+		if event.Stage != "download" || event.Component != changed.Slot ||
+			event.Total != changed.Bytes || event.Done < 0 || event.Done > event.Total {
+			t.Fatalf("unexpected download progress: %+v", event)
+		}
+	}
+	if first, last := progress[2], progress[len(progress)-1]; first.Done != 0 ||
+		last.Stage != "install" || last.Done != changed.Bytes || last.Total != changed.Bytes {
+		t.Fatalf("unexpected download bounds: first=%+v last=%+v", first, last)
 	}
 	old, _ := snapshot.Sign(m, key)
 	atomicfile.Write(filepath.Join(public, "manifest.json"), old, 0644)
@@ -296,5 +311,89 @@ func TestImmutableMirrorBaseAndUnapprovedHost(t *testing.T) {
 	after, _ := os.ReadFile(filepath.Join(c.Dir, "current.json"))
 	if string(before) != string(after) {
 		t.Fatal("changed checkpoint on rejected mirror")
+	}
+}
+
+func TestPollConditionalAndIncremental(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	public := filepath.Join(dir, "public")
+	now := time.Now().UTC()
+	first := makeCatalog(t, filepath.Join(dir, "first"), "1")
+	if _, err := exporter.Export(ctx, public, first, key, "", time.Hour, now); err != nil {
+		t.Fatal(err)
+	}
+	var objects, notModified atomic.Int32
+	var legacy atomic.Bool
+	handler := publish.Artifacts(public)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/manifest.json" {
+			objects.Add(1)
+			handler.ServeHTTP(w, r)
+			return
+		}
+		if legacy.Load() {
+			r.Header.Del("If-None-Match")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, r)
+		if rec.Code == http.StatusNotModified {
+			notModified.Add(1)
+			if rec.Body.Len() != 0 {
+				t.Error("304 carried a manifest body")
+			}
+		}
+		for k, v := range rec.Header() {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	}))
+	defer srv.Close()
+	c := Client{URL: srv.URL + "/v1/manifest.json", Dir: filepath.Join(dir, "agent"), HTTP: srv.Client(), TrustedKey: pub}
+	r, e := c.Poll(ctx)
+	if e != nil || !r.Changed || r.Downloaded != 2 {
+		t.Fatal(r, e)
+	}
+	checkpoint := filepath.Join(c.Dir, "current.json")
+	stamp := now.Add(-time.Hour)
+	if e = os.Chtimes(checkpoint, stamp, stamp); e != nil {
+		t.Fatal(e)
+	}
+	objects.Store(0)
+	r, e = c.Poll(ctx)
+	if e != nil || r.Changed || objects.Load() != 0 || notModified.Load() != 1 {
+		t.Fatal(r, e, objects.Load(), notModified.Load())
+	}
+	legacy.Store(true)
+	r, e = c.Poll(ctx)
+	if e != nil || r.Changed || objects.Load() != 0 {
+		t.Fatal(r, e)
+	}
+	info, e := os.Stat(checkpoint)
+	if e != nil || info.ModTime().Unix() != stamp.Unix() {
+		t.Fatal("unchanged polling rewrote checkpoint", e)
+	}
+	legacy.Store(false)
+	renewed, e := exporter.Export(ctx, public, first, key, "", time.Hour, now.Add(time.Second))
+	if e != nil {
+		t.Fatal(e)
+	}
+	r, e = c.Poll(ctx)
+	if e != nil || r.Changed || r.Revision != renewed.Revision || objects.Load() != 0 {
+		t.Fatal(r, e)
+	}
+	second := makeCatalog(t, filepath.Join(dir, "second"), "2")
+	if _, e = exporter.Export(ctx, public, second, key, "", time.Hour, now.Add(2*time.Second)); e != nil {
+		t.Fatal(e)
+	}
+	r, e = c.Poll(ctx)
+	if e != nil || !r.Changed || r.Downloaded != 1 || objects.Load() != 1 {
+		t.Fatal(r, e)
+	}
+	c.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	if _, e = c.Poll(ctx); e == nil {
+		t.Fatal("expired publication accepted by polling")
 	}
 }

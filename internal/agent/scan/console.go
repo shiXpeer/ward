@@ -3,6 +3,7 @@ package scan
 import (
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -16,6 +17,115 @@ type consoleGroup struct {
 	name, version, origin string
 	count                 int
 	example               Finding
+	advisories            []string
+	severityCounts        [2]int
+	exploited             bool
+}
+
+func sortedReviewReasons(counts map[string]int) []string {
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Slice(reasons, func(i, j int) bool {
+		if counts[reasons[i]] != counts[reasons[j]] {
+			return counts[reasons[i]] > counts[reasons[j]]
+		}
+		return reasons[i] < reasons[j]
+	})
+	return reasons
+}
+
+func severityRank(severity string) int {
+	switch strings.ToUpper(severity) {
+	case "CRITICAL":
+		return 0
+	case "HIGH":
+		return 1
+	case "MEDIUM":
+		return 2
+	case "LOW":
+		return 3
+	case "NEGLIGIBLE":
+		return 4
+	default:
+		return 5
+	}
+}
+
+func urgentFinding(f Finding) bool {
+	return f.Status == "affected" && (f.KnownExploited || severityRank(f.Severity) <= 1)
+}
+
+func consoleFindingLess(a, b Finding) bool {
+	if severityRank(a.Severity) != severityRank(b.Severity) {
+		return severityRank(a.Severity) < severityRank(b.Severity)
+	}
+	if a.KnownExploited != b.KnownExploited {
+		return a.KnownExploited
+	}
+	return findingLess(a, b)
+}
+
+func writeConsoleFinding(b *strings.Builder, g consoleGroup) {
+	f := g.example
+	label := strings.ToUpper(f.Severity)
+	if label == "" {
+		label = "UNKNOWN"
+	}
+	if g.exploited {
+		label = "KNOWN EXPLOITED / " + label
+	}
+	fmt.Fprintf(b, "  [%s] %s %s (%s)\n", terminalText(label, 48), terminalText(f.Component, 64), terminalText(f.Version, 48), terminalText(f.Origin, 48))
+	if f.Reason != "" {
+		fmt.Fprintf(b, "    Why flagged: %s.\n", terminalText(strings.TrimRight(f.Reason, "."), 220))
+	}
+	if len(f.Fixed) > 0 {
+		fmt.Fprintf(b, "    Fixed version: %s\n", terminalText(strings.Join(f.Fixed, ", "), 120))
+	} else {
+		b.WriteString("    Fixed version: unavailable in the matched advisory data.\n")
+	}
+	if f.Recommendation != "" {
+		fmt.Fprintf(b, "    Next step: %s\n", terminalText(f.Recommendation, 220))
+	}
+	fmt.Fprintf(b, "    Advisories: %d total · %d CRITICAL · %d HIGH (see full report).\n", g.count, g.severityCounts[0], g.severityCounts[1])
+}
+
+func guidanceAdvisory(f Finding, withSeverity bool) string {
+	if withSeverity {
+		return f.ID + " (" + f.Severity + ")"
+	}
+	return f.ID
+}
+
+func groupGuidance(findings []Finding, combineSeverity bool) []consoleGroup {
+	type guidance struct {
+		component, version, origin, ecosystem, reason, fixed, next, status, source, fixedSource string
+		severity                                                                                int
+		exploited                                                                               bool
+	}
+	grouped := map[guidance]int{}
+	shown := []consoleGroup{}
+	for _, f := range findings {
+		key := guidance{f.Component, f.Version, f.Origin, f.Ecosystem, f.Reason, strings.Join(f.Fixed, ", "), f.Recommendation, f.Status, f.Source, f.FixedSource, severityRank(f.Severity), f.KnownExploited}
+		if combineSeverity {
+			key.severity = 0
+		}
+		if i, ok := grouped[key]; ok {
+			if consoleFindingLess(f, shown[i].example) {
+				shown[i].example = f
+			}
+			shown[i].advisories = append(shown[i].advisories, guidanceAdvisory(f, combineSeverity))
+			continue
+		}
+		grouped[key] = len(shown)
+		shown = append(shown, consoleGroup{example: f, count: 1, advisories: []string{guidanceAdvisory(f, combineSeverity)}})
+	}
+	for i := range shown {
+		sort.Strings(shown[i].advisories)
+		shown[i].advisories = slices.Compact(shown[i].advisories)
+	}
+	return shown
 }
 
 func consoleGroups(findings []Finding, status string) []consoleGroup {
@@ -31,7 +141,11 @@ func consoleGroups(findings []Finding, status string) []consoleGroup {
 			groups[key] = g
 		}
 		g.count++
-		if priority(f) < priority(g.example) || priority(f) == priority(g.example) && f.ID < g.example.ID {
+		if rank := severityRank(f.Severity); rank < len(g.severityCounts) {
+			g.severityCounts[rank]++
+		}
+		g.exploited = g.exploited || f.KnownExploited
+		if consoleFindingLess(f, g.example) {
 			g.example = f
 		}
 	}
@@ -41,8 +155,8 @@ func consoleGroups(findings []Finding, status string) []consoleGroup {
 	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
-		if priority(a.example) != priority(b.example) {
-			return priority(a.example) < priority(b.example)
+		if a.example.KnownExploited != b.example.KnownExploited || severityRank(a.example.Severity) != severityRank(b.example.Severity) {
+			return consoleFindingLess(a.example, b.example)
 		}
 		if a.name != b.name {
 			return a.name < b.name
@@ -55,7 +169,7 @@ func consoleGroups(findings []Finding, status string) []consoleGroup {
 	return out
 }
 
-// Console prints bounded plain text that is safe for terminals, pipes and logs.
+// Console prints sanitized plain text that is safe for terminals, pipes and logs.
 // Counts distinguish completed component queries from matched advisory records;
 // missing coverage never becomes a claim that the host is safe.
 func Console(w io.Writer, r Report, jsonPath, markdownPath string) error {
@@ -89,34 +203,50 @@ func Console(w io.Writer, r Report, jsonPath, markdownPath string) error {
 		}
 		fmt.Fprintf(&b, "Kernel: %s | loaded source: %s | %s%s\n", terminalText(k.Release, 64), terminalText(loaded, 64), terminalText(k.Status, 24), boot)
 	}
+	if r.OmittedFindings > 0 {
+		fmt.Fprintf(&b, "Finding details omitted: %d (included in totals)\n", r.OmittedFindings)
+	}
 	affected := consoleGroups(r.Findings, "affected")
 	review := consoleGroups(r.Findings, "review")
-	fmt.Fprintf(&b, "Findings: %d affected components (%d version-rule matches)\n", len(affected), r.Confirmed)
-	fmt.Fprintf(&b, "Review: %d components with review-only result | %d components with review records (%d records)\n", doubtful, len(review), r.Review)
+	fmt.Fprintf(&b, "Findings: %d affected components shown (%d version-rule matches total)\n", len(affected), r.Confirmed)
+	fmt.Fprintf(&b, "Review: %d components with review-only result | %d components shown with review records (%d records total)\n", doubtful, len(review), r.Review)
+	for _, scope := range sortedReviewReasons(r.ReviewScopes) {
+		fmt.Fprintf(&b, "  %s — %d review records\n", scope, r.ReviewScopes[scope])
+	}
+
+	for _, reason := range sortedReviewReasons(r.ReviewReasons) {
+		fmt.Fprintf(&b, "  %d — %s\n", r.ReviewReasons[reason], terminalText(reason, 220))
+	}
+
+	if r.VEXResolved > 0 {
+		fmt.Fprintf(&b, "Ubuntu VEX: %d ambiguous applicability records resolved\n", r.VEXResolved)
+	}
+	if len(r.Inventory.Firewall) > 0 {
+		verdicts := map[string]int{}
+		for _, entry := range r.Inventory.Firewall {
+			verdicts[entry.Status]++
+		}
+		fmt.Fprintf(&b, "Local ingress: %d allowed | %d blocked | %d unknown entries (see report)\n", verdicts["ALLOWED"], verdicts["BLOCKED"], verdicts["UNKNOWN"])
+	}
 	if r.Status == "incomplete" {
 		b.WriteString("[ERROR] Scan incomplete. Findings and counts may be partial.\n")
 	}
 	if len(affected) > 0 {
 		b.WriteString("\nFINDINGS — highest priority first\n")
-		for i, g := range affected {
-			if i >= consoleFindings {
-				break
+		shownLower, omitted := 0, 0
+		for _, group := range affected {
+			urgent := group.exploited || group.severityCounts[0]+group.severityCounts[1] > 0
+			if !urgent && shownLower >= consoleFindings {
+				omitted++
+				continue
 			}
-			f := g.example
-			label := strings.ToUpper(f.Severity)
-			if label == "" {
-				label = "UNKNOWN"
+			if !urgent {
+				shownLower++
 			}
-			if f.KnownExploited {
-				label = "KNOWN EXPLOITED / " + label
-			}
-			fmt.Fprintf(&b, "  [%s] %s %s (%s) — %d matches; example: %s\n", terminalText(label, 48), terminalText(g.name, 64), terminalText(g.version, 48), terminalText(g.origin, 32), g.count, terminalText(f.ID, 96))
-			if len(f.Fixed) > 0 {
-				fmt.Fprintf(&b, "    Fixed version for this example: %s\n", terminalText(strings.Join(f.Fixed, ", "), 100))
-			}
+			writeConsoleFinding(&b, group)
 		}
-		if len(affected) > consoleFindings {
-			fmt.Fprintf(&b, "  ... %d more affected components in the full report\n", len(affected)-consoleFindings)
+		if omitted > 0 {
+			fmt.Fprintf(&b, "  ... %d more lower-severity affected components in the full report\n", omitted)
 		}
 	} else {
 		b.WriteString("\nNo confirmed version-rule matches in the checked coverage. This is not a clean bill of health.\n")

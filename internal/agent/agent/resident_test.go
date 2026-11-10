@@ -16,7 +16,10 @@ func TestResidentUpdatesBeforeFirstScanAndSurvivesErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var updates, scans atomic.Int32
-	update := func(context.Context) error { updates.Add(1); return errors.New("fixture update failure") }
+	update := func(context.Context) (bool, error) {
+		updates.Add(1)
+		return false, errors.New("fixture update failure")
+	}
 	scan := func(context.Context) error {
 		if updates.Load() < 1 {
 			t.Error("scan preceded initial update")
@@ -60,8 +63,26 @@ func TestSuccessfulBackgroundUpdateRequestsReport(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var scans atomic.Int32
-	err := Resident(ctx, func(context.Context) error { return nil }, func(context.Context) error {
+	err := Resident(ctx, func(context.Context) (bool, error) { return true, nil }, func(context.Context) error {
 		if scans.Add(1) == 2 {
+			cancel()
+		}
+		return nil
+	}, time.Second, time.Hour, log.New(io.Discard, "", 0))
+	if !errors.Is(err, context.Canceled) || scans.Load() != 2 {
+		t.Fatal(err, scans.Load())
+	}
+}
+
+func TestUnchangedPollDoesNotRequestScan(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var polls, scans atomic.Int32
+	err := Resident(ctx, func(context.Context) (bool, error) { return polls.Add(1) >= 3, nil }, func(context.Context) error {
+		if scans.Add(1) == 2 {
+			if polls.Load() < 3 {
+				t.Error("unchanged poll triggered a scan")
+			}
 			cancel()
 		}
 		return nil
