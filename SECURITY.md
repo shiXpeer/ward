@@ -73,3 +73,20 @@ catalog/export; a failed first fetch never becomes empty healthy coverage. Unkno
 vendor conditions, unsupported NVD Boolean/CNA applicability and missing package coverage must not
 be interpreted as a clean host. Raw source evidence stays on Beacon. Public source
 facts and local package lookup do not constitute an installed-version scanner.
+
+## Explicit server enrollment
+
+A configured relay may opt in to enrollment v1 using a separate management token.
+Reader and writer tokens cannot issue enrollment grants. Management remains in
+Ward's Keychain and must not be placed on an agent. A 15-minute grant binds a new
+server ID and report recipient public key; existing IDs/credentials are not
+silently replaced. A private installation nonce permits same-host retry without
+allowing another installation to claim the grant. Relay state and resulting writer
+credentials are private, bounded files; the relay stores only encrypted reports.
+
+The copied installation command contains a short-lived grant and public trust
+material, never the reader token or private report-decryption/signing keys. It
+executes bootstrap code bundled with Ward and downloads only signed, verified
+agent binaries from the explicitly chosen Beacon. The operator runs it with sudo
+on the target Linux host; Ward provides no remote shell/command endpoint. HTTPS,
+artifact expiry, pinned publisher keys and rollback checks remain mandatory.

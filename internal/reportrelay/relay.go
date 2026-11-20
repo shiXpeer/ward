@@ -64,15 +64,22 @@ func Seal(recipient, report []byte, id string) ([]byte, error) {
 }
 
 type Config struct {
-	Reader  string            `json:"reader_token"`
-	Writers map[string]string `json:"writer_tokens"`
+	Reader     string            `json:"reader_token"`
+	Enrollment string            `json:"enrollment_token,omitempty"`
+	Writers    map[string]string `json:"writer_tokens"`
 }
 
 func (c Config) Handler(dir string) (http.Handler, error) {
-	if len(c.Reader) < 32 || len(c.Writers) == 0 {
+	if len(c.Reader) < 32 || (len(c.Writers) == 0 && len(c.Enrollment) < 32) {
 		return nil, errors.New("configure a reader and at least one writer with tokens of at least 32 characters")
 	}
 	seen := map[string]bool{c.Reader: true}
+	if c.Enrollment != "" {
+		if len(c.Enrollment) < 32 || c.Enrollment == c.Reader {
+			return nil, errors.New("use a separate enrollment management token")
+		}
+		seen[c.Enrollment] = true
+	}
 	for id, token := range c.Writers {
 		if !idPattern.MatchString(id) || len(token) < 32 || seen[token] {
 			return nil, errors.New("invalid ID or missing/reused token")
@@ -82,10 +89,17 @@ func (c Config) Handler(dir string) (http.Handler, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
+	enrollment, err := newEnrollmentStore(dir, c.Writers)
+	if err != nil {
+		return nil, err
+	}
 	authorized := func(r *http.Request, token string) bool {
 		return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) == 1
 	}
 	mux := http.NewServeMux()
+	if c.Enrollment != "" {
+		enrollment.routes(mux, c.Enrollment)
+	}
 	mux.HandleFunc("GET /v1/reports", func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r, c.Reader) {
 			http.Error(w, "unauthorized", 401)
@@ -99,7 +113,7 @@ func (c Config) Handler(dir string) (http.Handler, error) {
 		ids := []string{}
 		for _, e := range entries {
 			id, ok := strings.CutSuffix(e.Name(), ".sealed")
-			if ok && !e.IsDir() && c.Writers[id] != "" {
+			if ok && !e.IsDir() && enrollment.writer(id) != "" {
 				ids = append(ids, id)
 			}
 		}
@@ -112,7 +126,7 @@ func (c Config) Handler(dir string) (http.Handler, error) {
 			return
 		}
 		id := r.PathValue("id")
-		if c.Writers[id] == "" {
+		if enrollment.writer(id) == "" {
 			http.NotFound(w, r)
 			return
 		}
@@ -122,7 +136,7 @@ func (c Config) Handler(dir string) (http.Handler, error) {
 	})
 	mux.HandleFunc("PUT /v1/reports/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		if c.Writers[id] == "" || !authorized(r, c.Writers[id]) {
+		if enrollment.writer(id) == "" || !authorized(r, enrollment.writer(id)) {
 			http.Error(w, "unauthorized", 401)
 			return
 		}

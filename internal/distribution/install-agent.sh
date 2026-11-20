@@ -3,12 +3,12 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-beacon= key= ca= pin= user_name=shixpeer-ward-agent
+beacon= key= ca= pin= enrollment= relay_ca= interval=1h user_name=shixpeer-ward-agent
 while (($#)); do
   case "$1" in
-    --beacon|--trusted-key|--ca-file|--key-sha256|--user)
+    --beacon|--trusted-key|--ca-file|--key-sha256|--user|--report-enrollment|--relay-ca-file|--collect-interval)
       (($# >= 2)) || { echo "Missing value: $1" >&2; exit 1; }
-      case "$1" in --beacon) beacon=$2;; --trusted-key) key=$2;; --ca-file) ca=$2;; --key-sha256) pin=$2;; --user) user_name=$2;; esac
+      case "$1" in --beacon) beacon=$2;; --trusted-key) key=$2;; --ca-file) ca=$2;; --key-sha256) pin=$2;; --user) user_name=$2;; --report-enrollment) enrollment=$2;; --relay-ca-file) relay_ca=$2;; --collect-interval) interval=$2;; esac
       shift 2;;
     *) echo "Unknown argument: $1" >&2; exit 1;;
   esac
@@ -18,6 +18,9 @@ done
 [[ $beacon =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || { echo '--beacon must be an HTTPS origin, without path or credentials.' >&2; exit 1; }
 [[ $user_name =~ ^[a-z_][a-z0-9_-]{0,31}$ && $user_name != root ]] || { echo 'A non-root service user is required.' >&2; exit 1; }
 [[ -n $key || $pin =~ ^[a-f0-9]{64}$ ]] || { echo 'Provide a trusted public key or independently obtained SHA256 SPKI fingerprint.' >&2; exit 1; }
+[[ $interval == 15m || $interval == 1h || $interval == 6h || $interval == 24h ]] || { echo 'Unsupported scan interval.' >&2; exit 1; }
+[[ -z $enrollment || ( -f $enrollment && -r $enrollment ) ]] || { echo 'Enrollment file missing.' >&2; exit 1; }
+[[ -z $relay_ca || ( -f $relay_ca && -r $relay_ca ) ]] || { echo 'Relay CA file missing.' >&2; exit 1; }
 for tool in curl openssl sha256sum systemctl getent runuser install awk stat; do command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }; done
 case $(uname -m) in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) echo 'Only amd64 and arm64 are supported.' >&2; exit 1;; esac
 tmp=$(mktemp -d)
@@ -56,6 +59,10 @@ done
 [[ -n $name ]] || { echo 'No signed agent for this architecture.' >&2; exit 1; }
 [[ -n $seen_amd64 && -n $seen_arm64 ]] || { echo 'Release must include both supported architectures.' >&2; exit 1; }
 cp "$tmp/$name" "$tmp/agent"
+if [[ -n $enrollment ]]; then
+  chmod 700 "$tmp/agent"
+  "$tmp/agent" enroll -h >/dev/null 2>&1 || { echo 'The signed agent release does not support enrollment. Publish a current agent release on the Beacon first.' >&2; exit 1; }
+fi
 if [[ $user_name == shixpeer-ward-agent ]] && { id ward-agent >/dev/null 2>&1 || [[ -e /home/ward-agent ]]; }; then
   echo 'Legacy agent account/state found. Follow the migration steps in docs/ubuntu-deployment.uk.md.' >&2
   exit 1
@@ -90,6 +97,20 @@ if [[ -n $ca ]]; then as_user install -m 600 "$tmp/ca.crt" "$base/config/ca.crt"
 as_user install -m 755 "$tmp/agent" "$base/bin/.agent-next"
 # Configure with the verified binary before replacing the running executable.
 as_user "$base/bin/.agent-next" setup -state "$base/agent" -feed-url "$beacon/v1/manifest.json" -trusted-key "$base/config/feed.pub" "${ca_flags[@]}"
+relay_ca_flags=()
+if [[ -n $relay_ca ]]; then
+  # Public CA material may be copied through the shared staging directory.
+  install -m 644 "$relay_ca" "$tmp/relay-ca.crt"
+  as_user install -m 600 "$tmp/relay-ca.crt" "$base/config/relay-ca.crt"
+  relay_ca_flags=(-ca-file "$base/config/relay-ca.crt")
+fi
+if [[ -n $enrollment ]]; then
+  # stdin is opened by root; the private ticket is never made world-readable
+  # and does not appear in the process arguments.
+  as_user "$base/bin/.agent-next" enroll -enrollment-file - -out "$base/report-upload.json" "${relay_ca_flags[@]}" < "$enrollment"
+fi
+upload_flags=
+if [[ -f $base/report-upload.json ]]; then upload_flags=" -report-upload-config $base/report-upload.json"; fi
 as_user mv -f "$base/bin/.agent-next" "$base/bin/shixpeer-ward-agent"
 unit=$(mktemp /etc/systemd/system/.shixpeer-ward-agent.XXXXXX)
 cat > "$unit" <<UNIT
@@ -102,7 +123,7 @@ Type=simple
 User=$user_name
 Environment=HOME=$home_dir
 Environment=SHIXPEER_WARD_MANAGED_CAPTURE=1
-ExecStart=$base/bin/shixpeer-ward-agent run -feed-interval 1m -collect-interval 1h
+ExecStart=$base/bin/shixpeer-ward-agent run -feed-interval 1m -collect-interval $interval$upload_flags
 WorkingDirectory=$home_dir
 UMask=0077
 Restart=on-failure
@@ -188,5 +209,6 @@ as_user install -m 600 "$tmp/revision" "$base/config/install-revision"
 as_user install -m 600 "$tmp/manifest-hash" "$base/config/install-manifest.sha256"
 echo "Agent installed as $user_name. Data/reports: $base/agent"
 echo 'No software updates or firewall changes performed. Database sync and scans run in the service.'
+if [[ -n $upload_flags ]]; then echo 'Encrypted report upload enabled. First delivery follows the initial database sync and scan.'; fi
 echo "Follow reports: sudo -u $user_name tail -f $base/logs/agent.log"
 echo 'Startup errors: sudo journalctl -u shixpeer-ward-agent -n 50 --no-pager'

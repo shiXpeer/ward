@@ -47,6 +47,9 @@ func run(args []string) error {
 		defer cancel()
 		return (collect.Host{}).CaptureDocker(ctx, os.Stdout)
 	}
+	if args[0] == "enroll" {
+		return enrollAgent(args[1:])
+	}
 	if args[0] == "probe" {
 		return probeTCP(args[1:])
 	}
@@ -58,7 +61,7 @@ func run(args []string) error {
 		return nil
 	}
 	if args[0] == "help" || args[0] == "--help" {
-		fmt.Println("Shixpeer Ward — https://shixpeer.com\nCommands: setup (save download settings), update (signed database, changed objects only; default), pull (alias), check-update (signed manifest only), scan (offline system report), collect (offline), lookup (offline), probe (explicit TCP check), run (resident update + scan), migrate-home (copy legacy state into home).\nUse COMMAND -h for options. No software updates or remote commands.")
+		fmt.Println("Shixpeer Ward — https://shixpeer.com\nCommands: enroll (redeem a short-lived server enrollment), setup (save download settings), update (signed database, changed objects only; default), pull (alias), check-update (signed manifest only), scan (offline system report), collect (offline), lookup (offline), probe (explicit TCP check), run (resident update + scan), migrate-home (copy legacy state into home).\nUse COMMAND -h for options. No software updates or remote commands.")
 		return nil
 	}
 	cmd := args[0]
