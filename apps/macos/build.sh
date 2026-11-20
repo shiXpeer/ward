@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 app="$PWD/dist/macos/Shixpeer Ward.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp internal/distribution/install-agent.sh "$app/Contents/Resources/InstallAgent.sh"
 cp apps/macos/Info.plist "$app/Contents/Info.plist"
 icon_tmp="$(mktemp -d)"
 trap 'rm -rf "$icon_tmp"' EXIT
@@ -17,7 +18,7 @@ iconutil -c icns "$iconset" -o "$app/Contents/Resources/WardMatte.icns"
 arch="$(uname -m)"
 case "$arch" in arm64) goarch=arm64;; x86_64) goarch=amd64;; *) exit 1;; esac
 CGO_ENABLED=0 GOOS=darwin GOARCH="$goarch" go build -trimpath -o "$app/Contents/MacOS/shixpeer-ward-agent" ./cmd/shixpeer-ward-agent
-swiftc -parse-as-library -O -target "$arch-apple-macos14.0" apps/macos/Ward.swift -o "$app/Contents/MacOS/Ward"
+swiftc -parse-as-library -O -target "$arch-apple-macos14.0" apps/macos/Ward.swift apps/macos/ServerReports.swift apps/macos/ServerEnrollment.swift apps/macos/NativeInstallerUpdates.swift -o "$app/Contents/MacOS/Ward"
 codesign --force --sign - "$app/Contents/MacOS/shixpeer-ward-agent"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"

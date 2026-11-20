@@ -4,6 +4,7 @@ import CryptoKit
 import Security
 import ServiceManagement
 import UniformTypeIdentifiers
+import UserNotifications
 
 struct WardError: LocalizedError {
     let errorDescription: String?
@@ -326,6 +327,18 @@ private struct WardPreferences: Codable {
     var scanMinutes = 0
     var scanAfterDatabaseUpdate: Bool? = nil
     var applicationMinutes = 0
+    var notifyApplicationUpdates: Bool? = nil
+    var notifyNewFindings: Bool? = nil
+
+    var applicationNotifications: Bool {
+        get { notifyApplicationUpdates ?? false }
+        set { notifyApplicationUpdates = newValue }
+    }
+
+    var findingNotifications: Bool {
+        get { notifyNewFindings ?? false }
+        set { notifyNewFindings = newValue }
+    }
 
     var scanNewDatabase: Bool {
         get { scanAfterDatabaseUpdate ?? false }
@@ -347,11 +360,119 @@ private struct WardPreferences: Codable {
             if let data = try? JSONEncoder().encode(preferences) {
                 UserDefaults.standard.set(data, forKey: WardPreferences.key)
             }
+            if (preferences.applicationNotifications && !oldValue.applicationNotifications) ||
+                (preferences.findingNotifications && !oldValue.findingNotifications) {
+                Task {
+                    _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                }
+            }
             if preferences.databaseMinutes != oldValue.databaseMinutes { schedule(.database) }
             if preferences.scanMinutes != oldValue.scanMinutes { schedule(.scan) }
             if preferences.applicationMinutes != oldValue.applicationMinutes { schedule(.applications) }
         }
     }
+    @Published private(set) var serverCatalog = ServerCatalog()
+    @Published private(set) var syncingServerReports = false
+    @Published private(set) var serverStorageError = ""
+    @Published var automaticServerSync = UserDefaults.standard.object(forKey: "ward.servers.autoSync") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(automaticServerSync, forKey: "ward.servers.autoSync")
+            if automaticServerSync { Task { await syncServerReports() } }
+        }
+    }
+    let serverArchive = ServerReportArchive(root: FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".shixpeer.ward/macos/server-reports", isDirectory: true))
+    private var serverSyncTask: Task<Void, Never>?
+    private var serverArchiveReady = false
+    private var nextServerSync = Date.distantPast
+    var servers: [ServerRecord] {
+        let connected = Set(beacons.map(\.id))
+        return serverCatalog.servers.filter { connected.contains($0.beaconID) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    private func restoreServerReports() async {
+        do {
+            serverCatalog = try await serverArchive.load()
+            for server in servers {
+                guard let latest = server.latest else { continue }
+                do {
+                    let (_, report) = try await serverArchive.read(server, snapshot: latest.id)
+                    put(Device(id: server.id, name: server.name, report: report))
+                } catch {
+                    if let index = serverCatalog.servers.firstIndex(where: { $0.id == server.id }) {
+                        serverCatalog.servers[index].error = error.localizedDescription
+                    }
+                }
+            }
+            serverArchiveReady = true
+        } catch { serverStorageError = "Could not restore server history: " + error.localizedDescription }
+    }
+
+    func syncServerReports(_ only: Beacon? = nil) async {
+        guard serverArchiveReady, !syncingServerReports else { return }
+        let sources = only.map { [$0] } ?? beacons.filter { !$0.relay.isEmpty }
+        guard !sources.isEmpty else { return }
+        syncingServerReports = true
+        nextServerSync = Date().addingTimeInterval(300)
+        defer { syncingServerReports = false }
+        for beacon in sources {
+            var receivedIDs: Set<String>?
+            var failures: [String: String] = [:]
+            var failure: String?
+            do {
+                let origin = try Wire.origin(beacon.relay)
+                let key = try Vault.recipient()
+                guard let token = try Vault.read(beacon.id.uuidString) else { throw WardError("Relay read token missing.") }
+                let base = origin.appendingPathComponent("v1/reports")
+                let raw = try await Wire.fetch(base, token: token, limit: 1 << 20)
+                let ids = try ServerReportArchive.relayIDs(raw)
+                receivedIDs = Set(ids)
+                for id in ids {
+                    do {
+                        let envelope = try await Wire.fetch(base.appendingPathComponent(id), token: token, limit: Wire.maxReport + 61)
+                        let data = try await Task.detached { try Wire.open(envelope, id: id, key: key) }.value
+                        let previous = devices.first { $0.id == beacon.id.uuidString + ":" + id }?.report
+                        let (catalog, report) = try await serverArchive.accept(data, beaconID: beacon.id, serverID: id)
+                        serverCatalog = catalog
+                        let server = catalog.servers.first { $0.beaconID == beacon.id && $0.serverID == id }!
+                        put(Device(id: server.id, name: server.name, report: report))
+                        if preferences.findingNotifications, let previous {
+                            func matches(_ report: Report) -> Set<[String]> {
+                                Set(report.findings.filter { $0.status == "affected" }.map { [$0.component, $0.origin ?? "", $0.source ?? "", $0.id] })
+                            }
+                            let count = matches(report).subtracting(matches(previous)).count
+                            if count > 0 {
+                                postSystemNotification(title: "New server findings", body: "\(server.name): \(count) new advisory matches.")
+                            }
+                        }
+                    } catch { failures[id] = error.localizedDescription }
+                }
+                if !failures.isEmpty { failure = "\(failures.count) reports could not be fetched or verified." }
+            } catch { failure = error.localizedDescription }
+            do {
+                serverCatalog = try await serverArchive.finish(beaconID: beacon.id, ids: receivedIDs, errors: failures, error: failure)
+            } catch { serverStorageError = "Could not save sync status: " + error.localizedDescription }
+        }
+    }
+
+    func openServerReport(_ server: ServerRecord, snapshot: ServerSnapshot) async {
+        do {
+            let (_, report) = try await serverArchive.read(server, snapshot: snapshot.id)
+            let id = snapshot.id == server.latest?.id ? server.id : "server-history:" + server.id + ":" + snapshot.id
+            devices.removeAll { $0.id.hasPrefix("server-history:") && $0.id != id }
+            put(Device(id: id, name: server.name, report: report))
+            selection = id
+        } catch { message = error.localizedDescription }
+    }
+
+    func setServerInterval(_ server: ServerRecord, seconds: TimeInterval) {
+        Task {
+            do { serverCatalog = try await serverArchive.setInterval(serverID: server.id, seconds: seconds) }
+            catch { message = error.localizedDescription }
+        }
+    }
+
     private enum Maintenance: CaseIterable, Hashable { case database, scan, applications }
     private var nextMaintenance: [Maintenance: Date] = [:]
     private var maintenanceTimer: Task<Void, Never>?
@@ -438,11 +559,11 @@ private struct WardPreferences: Codable {
     @Published var activity = ""
     @Published var message = ""
     @Published private(set) var availableAppUpdateIDs = Set((AppUpdateStore.load()?.results ?? [:]).compactMap {
-        $0.value.newer && NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0.key) != nil ? $0.key : nil
+        currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil
     })
 
     fileprivate func updateAppBadge(_ results: [String: AppUpdateRecord], for identifiers: Set<String>) {
-        availableAppUpdateIDs = Set(results.compactMap { $0.value.newer && identifiers.contains($0.key) ? $0.key : nil })
+        availableAppUpdateIDs = Set(results.compactMap { identifiers.contains($0.key) && currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil })
     }
 
     @Published var applicationCheckProgress: (completed: Int, total: Int)?
@@ -476,6 +597,16 @@ private struct WardPreferences: Codable {
             devices.append(Device(id: "local", name: "This Mac", report: report))
         }
         loadImports()
+        serverSyncTask = Task { [weak self] in
+            await self?.restoreServerReports()
+            while !Task.isCancelled {
+                if let self, self.automaticServerSync, Date() >= self.nextServerSync {
+                    await self.syncServerReports()
+                }
+                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+                guard self != nil else { return }
+            }
+        }
         for job in Maintenance.allCases { schedule(job) }
         maintenanceTimer = Task { [weak self] in
             while !Task.isCancelled {
@@ -532,9 +663,11 @@ private struct WardPreferences: Codable {
         devices.removeAll { $0.id.hasPrefix(beacon.id.uuidString + ":") }
         if activeFeed == beacon.id { activeFeed = nil }
         selection = "local"
-        let result = SecItemDelete(Vault.query(beacon.id.uuidString) as CFDictionary)
-        if result != errSecSuccess && result != errSecItemNotFound {
-            throw WardError("Beacon removed. Keychain token cleanup failed (\(result)).")
+        for account in [beacon.id.uuidString, beacon.id.uuidString + ".enrollment"] {
+            let result = SecItemDelete(Vault.query(account) as CFDictionary)
+            if result != errSecSuccess && result != errSecItemNotFound {
+                throw WardError("Beacon removed. Keychain token cleanup failed (\(result)).")
+            }
         }
     }
     func removeReport(_ device: Device) {
@@ -651,6 +784,49 @@ private struct WardPreferences: Codable {
         if let index = devices.firstIndex(where: { $0.id == device.id }) { devices[index] = device }
         else { devices.append(device) }
     }
+    func createServerEnrollment(_ beacon: Beacon, serverID: String, interval: String,
+                                managementToken: String, relayCAPath: String) async throws -> (String, Date) {
+        let token = managementToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard token.utf8.count >= 32 else { throw WardError("Enter the separate relay enrollment token.") }
+        let feed = try Wire.origin(beacon.feed).absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let relay = try Wire.origin(beacon.relay)
+        let feedKey = try ServerEnrollmentCommand.readPublicFile(trustFile(beacon.feedKey, named: "feed.pub"), maximum: 4096)
+        let feedCA = beacon.caFile.isEmpty ? nil : try ServerEnrollmentCommand.readPublicFile(trustFile(beacon.caFile, named: "ca.crt"), maximum: 65536)
+        let relayCA = relayCAPath.isEmpty ? nil : try ServerEnrollmentCommand.readPublicFile(relayCAPath, maximum: 65536)
+        guard let installerURL = Bundle.main.url(forResource: "InstallAgent", withExtension: "sh") else {
+            throw WardError("Bundled agent installer missing. Rebuild Ward.")
+        }
+        let installer = try Data(contentsOf: installerURL)
+        let recipient = try Vault.recipient().publicKey.rawRepresentation.base64EncodedString()
+        var request = URLRequest(url: relay.appendingPathComponent("v1/enrollments"), timeoutInterval: 30)
+        request.httpMethod = "POST"
+        request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["server_id": serverID, "recipient_public_key": recipient])
+        let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw WardError("Invalid relay response.") }
+        switch http.statusCode {
+        case 201: break
+        case 401: throw WardError("Enrollment token rejected. Use the management token, not the reader or writer token.")
+        case 404: throw WardError("Update the relay and enable enrollment first. Open Relay setup for the command.")
+        case 409: throw WardError("Server ID is already registered or the relay is full. Choose a new ID; existing credentials will not be replaced.")
+        default: throw WardError("Relay enrollment failed (HTTP \(http.statusCode)).")
+        }
+        var data = Data()
+        for try await byte in bytes {
+            guard data.count < 16384 else { throw WardError("Enrollment response exceeds its size limit.") }
+            data.append(byte)
+        }
+        let grant = try JSONDecoder().decode(ServerEnrollmentCommand.Grant.self, from: data)
+        let command = try ServerEnrollmentCommand.build(installer: installer, feed: feed, feedKey: feedKey, feedCA: feedCA,
+            relay: relay.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")), relayCA: relayCA,
+            serverID: serverID, interval: interval, recipient: recipient, grant: grant)
+        try Vault.store(Data(token.utf8), beacon.id.uuidString + ".enrollment")
+        return (command, grant.expiry!)
+    }
+
     func verifyServerReport(_ beacon: Beacon, id: String, since: Date) async throws -> (Device, Data) {
         guard id.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", options: .regularExpression) != nil else {
             throw WardError("Enter a valid server ID.")
@@ -667,33 +843,16 @@ private struct WardPreferences: Codable {
         guard let date, date >= since else {
             throw WardError("This report predates the test. Run a new scan and check that the server clock is correct.")
         }
-        let device = Device(id: beacon.id.uuidString + ":" + id, name: beacon.name + " / " + id, report: report)
+        guard serverArchiveReady else { throw WardError("Server history is not ready. Reopen Ward and check Servers.") }
+        let (catalog, latest) = try await serverArchive.accept(raw, beaconID: beacon.id, serverID: id)
+        serverCatalog = catalog
+        let device = Device(id: beacon.id.uuidString + ":" + id, name: latest.hostName ?? id, report: latest)
         put(device)
         return (device, raw)
     }
 
     func refresh(_ beacon: Beacon) async {
-        guard !busy else { return }
-        busy = true
-        activity = "Fetching encrypted reports from \(beacon.name)…"
-        defer { busy = false; activity = "" }
-        do {
-            let origin = try Wire.origin(beacon.relay)
-            let key = try Vault.recipient()
-            guard let token = try Vault.read(beacon.id.uuidString) else { throw WardError("Relay read token missing.") }
-            let reports = origin.appendingPathComponent("v1/reports")
-            let ids = try JSONDecoder().decode([String].self, from: await Wire.fetch(reports, token: token, limit: 1 << 20))
-            var failures = 0
-            for id in ids {
-                guard id.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", options: .regularExpression) != nil else { failures += 1; continue }
-                do {
-                    let envelope = try await Wire.fetch(reports.appendingPathComponent(id), token: token, limit: Wire.maxReport + 61)
-                    let report = try Wire.decode(Wire.open(envelope, id: id, key: key))
-                    put(Device(id: beacon.id.uuidString + ":" + id, name: beacon.name + " / " + id, report: report))
-                } catch { failures += 1 }
-            }
-            if failures > 0 { message = "\(failures) reports could not be fetched or authenticated." }
-        } catch { message = error.localizedDescription }
+        await syncServerReports(beacon)
     }
     private func trustFile(_ input: String, named filename: String) throws -> String {
         var path = (input.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
@@ -707,6 +866,43 @@ private struct WardPreferences: Codable {
         }
         return path
     }
+    private func deliverSystemNotification(title: String, body: String) async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        var settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound])
+            settings = await center.notificationSettings()
+        }
+        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return false }
+        let content = UNMutableNotificationContent()
+        content.title = title; content.body = body; content.sound = .default
+        do {
+            try await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+            return true
+        } catch { return false }
+    }
+    private func postSystemNotification(title: String, body: String) {
+        Task { _ = await deliverSystemNotification(title: title, body: body) }
+    }
+
+    private func notifyNewFindings(previous: Report?, current: Report) {
+        guard preferences.findingNotifications, current.database != nil else { return }
+        func keys(_ report: Report) -> Set<[String]> {
+            Set(report.findings.filter { $0.status == "affected" }.map {
+                [$0.origin ?? "", $0.ecosystem ?? "", $0.component, $0.source ?? "", $0.id]
+            })
+        }
+        if let previous {
+            guard previous.database != nil,
+                  previous.findings.lazy.filter({ $0.status == "affected" }).count >= previous.confirmed else { return }
+        }
+        let count = keys(current).subtracting(previous.map(keys) ?? []).count
+        if count > 0 {
+            postSystemNotification(title: "New security findings",
+                                   body: "\(count.formatted()) new advisory matches on This Mac. Open Findings for details.")
+        }
+    }
+
     fileprivate func checkApplicationVersions(_ provided: [Report.Inventory.Application]? = nil, showProgress: Bool = false) async {
         guard !checkingAppVersions, !installingApplication, !busy else { return }
         checkingAppVersions = true
@@ -721,14 +917,15 @@ private struct WardPreferences: Codable {
             let scanned = devices.first(where: { $0.id == "local" })?.report.inventory.applications ?? []
             apps = scanned + outsideApplications(known: Set(scanned.map(\.identifier)), includeStandardLocations: true)
         }
-        let jobs = updateJobs(for: apps)
+        let minimumEnd = ContinuousClock.now + .milliseconds(900)
+        let jobs = await Task.detached { updateJobs(for: apps) }.value
         guard !jobs.isEmpty else {
             applicationUpdateNote = "No application update channels found."
             return
         }
         if showProgress { applicationCheckProgress = (0, jobs.count) }
         applicationUpdateNote = "Checking \(jobs.count.formatted()) application update channels."
-        let results = await withTaskGroup(of: (String, AppUpdateRecord).self) { group in
+        var results = await withTaskGroup(of: (String, AppUpdateRecord).self) { group in
             for job in jobs { group.addTask { (job.id, await job.lookup()) } }
             var found: [String: AppUpdateRecord] = [:]
             for await (id, record) in group {
@@ -737,11 +934,32 @@ private struct WardPreferences: Codable {
             }
             return found
         }
+        for (id, failed) in results where failed.reported.isEmpty {
+            if var known = appUpdateChecks[id], known.newer, known.installed == failed.installed {
+                if !known.text.hasPrefix("Could not refresh.") { known.text = "Could not refresh. " + known.text }
+                results[id] = known
+            }
+        }
+        // Track delivered notifications separately from discovery/cache. A check
+        // while notifications were disabled must not suppress a later alert.
+        let observationKey = "ward.application-update-notifications.v2"
+        var notified = UserDefaults.standard.dictionary(forKey: observationKey) as? [String: String] ?? [:]
+        let installedIDs = Set(apps.map(\.identifier))
+        notified = notified.filter { installedIDs.contains($0.key) }
+        for (id, record) in results where !record.reported.isEmpty && !record.newer { notified.removeValue(forKey: id) }
+        let pending = AppUpdateAlerts.pending(results, notified: notified)
+        if preferences.applicationNotifications, !pending.isEmpty,
+           await deliverSystemNotification(title: "New application updates",
+                body: "\(pending.count.formatted()) updates available. Open Applications for details.") {
+            for (id, record) in pending { notified[id] = record.reported }
+        }
+        UserDefaults.standard.set(notified, forKey: observationKey)
         appUpdateChecks.merge(results) { _, new in new }
         AppUpdateStore.save(appUpdateChecks)
         updateAppBadge(appUpdateChecks, for: Set(apps.map(\.identifier)))
         let available = results.values.filter(\.newer).count
         applicationUpdateNote = "Checked \(jobs.count.formatted()) channels · \(available.formatted()) updates available."
+        if showProgress, ContinuousClock.now < minimumEnd { try? await ContinuousClock().sleep(until: minimumEnd) }
     }
 
     func dismissScanIssue() { scanIssue = nil }
@@ -778,6 +996,7 @@ private struct WardPreferences: Codable {
         }
         activity = update ? (checkOnly ? "Checking for a database update…" : "Updating signed database…") : "Scanning this Mac…"
         var scanAfterUpdate = false
+        var checkAppsAfterScan = false
         defer {
             scanProcess = nil
             updatingScanDatabase = false
@@ -785,6 +1004,9 @@ private struct WardPreferences: Codable {
             busy = false
             scanningMac = false
             activity = ""
+            if checkAppsAfterScan {
+                Task { await self.checkApplicationVersions(showProgress: !background) }
+            }
         }
         do {
             guard let agent = Bundle.main.url(forAuxiliaryExecutable: "shixpeer-ward-agent") else { throw WardError("Bundled agent missing.") }
@@ -845,10 +1067,13 @@ private struct WardPreferences: Codable {
             let current = try? reportURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
             guard current != nil, current != previous else { throw WardError("The agent did not produce a fresh report.") }
             let report = try Wire.decode(Data(contentsOf: reportURL))
+            let previousReport = devices.first(where: { $0.id == "local" })?.report
             verifiedFormulas.removeAll()
             if !background && !scanAfterUpdate { devicePath = [] }
             put(Device(id: "local", name: "This Mac", report: report))
+            checkAppsAfterScan = true
             if result == 0 {
+                notifyNewFindings(previous: previousReport, current: report)
                 if !background && !scanAfterUpdate { selection = "local" }
                 if scanAfterUpdate { showNotice("System scan completed with the new database.") }
             } else {
@@ -1106,20 +1331,26 @@ private struct WardPreferences: Codable {
     }
 }
 
-@MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusMenu: WardStatusMenu?
 
-    func connectStatusMenu(to model: WardModel, openSettings: @escaping () -> Void) {
+    func connectStatusMenu(to model: WardModel, openPage: @escaping (String) -> Void) {
         if let statusMenu {
-            statusMenu.openSettings = openSettings
+            statusMenu.openPage = openPage
         } else {
-            statusMenu = WardStatusMenu(model: model, openSettings: openSettings)
+            statusMenu = WardStatusMenu(model: model, openPage: openPage)
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                           willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list, .sound]
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
         if let url = Bundle.main.url(forResource: "WardMatte", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
             NSApplication.shared.applicationIconImage = icon
@@ -1150,9 +1381,9 @@ private struct WardMainWindow: View {
             .focusEffectDisabled()
             .onAppear {
                 if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
-                appDelegate.connectStatusMenu(to: model) {
-                    model.selection = "settings"
-                    if let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "Shixpeer Ward" }) {
+                appDelegate.connectStatusMenu(to: model) { page in
+                    model.selection = page
+                    if let window = NSApp.windows.first(where: { $0.title == "Shixpeer Ward" && $0.canBecomeKey }) {
                         window.makeKeyAndOrderFront(nil)
                     } else {
                         openWindow(id: "ward-main")
@@ -1165,16 +1396,16 @@ private struct WardMainWindow: View {
 
 @MainActor private final class WardStatusMenu: NSObject, NSMenuDelegate {
     private weak var model: WardModel?
-    var openSettings: () -> Void
+    var openPage: (String) -> Void
     private var observer: AnyCancellable?
     private var windowObserver: AnyCancellable?
     private var item: NSStatusItem?
     private var refreshPending = false
     private let menu = NSMenu()
 
-    init(model: WardModel, openSettings: @escaping () -> Void) {
+    init(model: WardModel, openPage: @escaping (String) -> Void) {
         self.model = model
-        self.openSettings = openSettings
+        self.openPage = openPage
         super.init()
         menu.delegate = self
         menu.autoenablesItems = false
@@ -1221,23 +1452,22 @@ private struct WardMainWindow: View {
             item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
             item?.menu = menu
         }
-        let symbol: String
-        let status: String
-        if model.updatingScanDatabase {
-            symbol = "arrow.triangle.2.circlepath"; status = model.activity
-        } else if model.scanningMac {
-            symbol = "magnifyingglass.circle.fill"; status = model.activity
-        } else if model.checkingAppVersions {
-            symbol = "macwindow.badge.plus"; status = "Checking application versions"
-        } else if model.databaseUpdateAvailable {
-            symbol = "shield.lefthalf.filled"; status = "Database update available"
-        } else {
-            symbol = "shield"; status = "Ready"
+        let count = model.availableAppUpdateIDs.filter { id in
+            model.appUpdateChecks[id].map { currentlyNeedsAppUpdate(id, record: $0) } == true
+        }.count
+        let image = NSImage(size: NSSize(width: 22, height: 20), flipped: false) { _ in
+            NSImage(systemSymbolName: "shield", accessibilityDescription: nil)?
+                .draw(in: NSRect(x: 1, y: 1, width: 16, height: 18))
+            if count > 0 {
+                NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: nil)?
+                    .draw(in: NSRect(x: 12, y: 10, width: 10, height: 10))
+            }
+            return true
         }
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        image?.isTemplate = true
+        image.isTemplate = true
         item?.button?.image = image
-        item?.button?.toolTip = "Shixpeer Ward · " + status
+        item?.button?.toolTip = count > 0 ? "Shixpeer Ward · \(count) application updates available" : "Shixpeer Ward · Ready"
+        item?.button?.setAccessibilityLabel(count > 0 ? "Ward: \(count) application updates available" : "Ward")
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -1245,20 +1475,14 @@ private struct WardMainWindow: View {
         menu.removeAllItems()
         model.refreshLoginStatus()
         let unavailable = model.busy || model.checkingAppVersions || model.installingApplication
-        if model.checkingAppVersions || model.busy {
-            add(model.checkingAppVersions ? "Checking application versions…" : model.activity, action: nil)
-        } else if model.databaseUpdateAvailable {
-            add("Database update available", action: nil)
-        }
-        if model.updatingScanDatabase || model.scanningMac {
-            add(model.updatingScanDatabase ? "Stop database update" : "Stop system scan",
-                action: #selector(stop), enabled: !model.cancellingScan && model.scanProgress?.stage != "updated")
-        } else {
-            add("Update Database Now", action: #selector(update), enabled: !unavailable)
-            add("Check for Database Update", action: #selector(checkDatabase), enabled: !unavailable)
-            add("Scan This Mac", action: #selector(scan), enabled: !unavailable)
-        }
+        add("Open Ward", action: #selector(showWard))
+        add("Available Application Updates", action: #selector(showUpdates))
+        menu.addItem(.separator())
+        add("Update Database Now", action: #selector(update), enabled: !unavailable)
+        add("Check for Database Update", action: #selector(checkDatabase), enabled: !unavailable)
+        add("Scan This Mac", action: #selector(scan), enabled: !unavailable)
         add("Check Application Versions", action: #selector(checkApps), enabled: !unavailable)
+        add("Cancel Current Task", action: #selector(stop), enabled: (model.scanningMac || model.updatingScanDatabase) && !model.cancellingScan)
         menu.addItem(.separator())
         add("Launch at Login", action: #selector(toggleLogin))
         menu.items.last?.state = model.launchAtLogin ? .on : .off
@@ -1276,26 +1500,38 @@ private struct WardMainWindow: View {
         menu.addItem(entry)
     }
 
-    @objc private func update() { Task { await model?.localScan(update: true, updateOnly: true) } }
-    @objc private func checkDatabase() { Task { await model?.localScan(update: true, updateOnly: true, checkOnly: true) } }
-    @objc private func scan() { Task { await model?.localScan(update: false) } }
-    @objc private func checkApps() { Task { await model?.checkApplicationVersions() } }
-    @objc private func stop() { model?.cancelScan() }
+    private func show(_ page: String) {
+        menu.cancelTracking()
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        openPage(page)
+    }
+    @objc private func showWard() { show("home") }
+    @objc private func showUpdates() { show("local:applications") }
+    @objc private func update() { show("database"); Task { await model?.localScan(update: true, updateOnly: true) } }
+    @objc private func checkDatabase() { show("database"); Task { await model?.localScan(update: true, updateOnly: true, checkOnly: true) } }
+    @objc private func scan() { show("local"); Task { await model?.localScan(update: false) } }
+    @objc private func checkApps() { show("local:applications"); Task { await model?.checkApplicationVersions(showProgress: true) } }
+    @objc private func stop() { show("local"); model?.cancelScan() }
     @objc private func toggleLogin() {
+        show("settings")
         guard let model else { return }
         model.setLaunchAtLogin(!model.launchAtLogin)
     }
-    @objc private func openLoginItems() { SMAppService.openSystemSettingsLoginItems() }
-
-    @objc private func settings() {
-        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
-        openSettings()
-    }
+    @objc private func openLoginItems() { show("settings"); SMAppService.openSystemSettingsLoginItems() }
+    @objc private func settings() { show("settings") }
     @objc private func quit() { model?.cancelScan(); NSApp.terminate(nil) }
 }
 
 private struct WardSettingsPage: View {
     @ObservedObject var model: WardModel
+    @State private var notificationAuthorization: UNAuthorizationStatus?
+    @State private var notificationBanners = true
+
+    private func refreshNotificationPermission() async {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        notificationAuthorization = settings.authorizationStatus
+        notificationBanners = settings.alertSetting == .enabled
+    }
 
     var body: some View {
         ScrollView {
@@ -1336,6 +1572,21 @@ private struct WardSettingsPage: View {
                         LabeledContent("Last system scan", value: date.formatted(date: .abbreviated, time: .shortened))
                     }
                 }
+                section("Notifications", symbol: "bell") {
+                    Toggle("New application updates", isOn: $model.preferences.applicationNotifications)
+                    Toggle("New security findings", isOn: $model.preferences.findingNotifications)
+                    Text("Applies to manual and scheduled checks.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if notificationAuthorization == .denied {
+                        Label("macOS blocks Ward notifications. Enable them in System Settings → Notifications.", systemImage: "bell.slash")
+                            .font(.caption).foregroundStyle(.orange)
+                    } else if notificationAuthorization == .authorized && !notificationBanners {
+                        Label("macOS banners are off. Enable banners for Ward in System Settings → Notifications.", systemImage: "bell.badge")
+                            .font(.caption).foregroundStyle(.orange)
+                    } else if notificationAuthorization == .authorized {
+                        Text("macOS notifications allowed").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 section("Application versions", symbol: "macwindow") {
                     interval("Check installed applications for new versions", selection: $model.preferences.applicationMinutes)
                     Text("Checks supported update channels while Ward is running.")
@@ -1347,8 +1598,10 @@ private struct WardSettingsPage: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .onAppear { model.refreshLoginStatus() }
+        .task { await refreshNotificationPermission() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshLoginStatus()
+            Task { await refreshNotificationPermission() }
         }
     }
 
@@ -1762,7 +2015,10 @@ struct Dashboard: View {
                         Button("Rename Report…", systemImage: "pencil") { renameReport(report) }
                     }
             }
-            ForEach(model.devices.filter { $0.id != "local" && !$0.id.hasPrefix("import:") }) { device in
+            ForEach(model.devices.filter { device in
+                device.id != "local" && !device.id.hasPrefix("import:") && !device.id.hasPrefix("server-history:") &&
+                    !model.servers.contains(where: { $0.id == device.id })
+            }) { device in
                 menuRow(device.id, device.name, "server.rack", Color(red: 0.55, green: 0.62, blue: 0.82), count: device.report.confirmed > 0 ? device.report.confirmed : nil)
             }
         case .data:
@@ -1770,7 +2026,11 @@ struct Dashboard: View {
             MenuRow(title: "Manage Beacons", symbol: "antenna.radiowaves.left.and.right", tint: .purple,
                     count: model.beacons.count, selected: false) { openPage("beacons") }
         case .servers:
-            menuRow("servers", "Servers", "server.rack", .mint)
+            menuRow("servers", "Servers", "server.rack", .mint, count: model.servers.count)
+            ForEach(model.servers) { server in
+                menuRow(server.id, server.name, "server.rack", .mint,
+                        count: server.latest.map { $0.findings > 0 ? $0.findings : nil } ?? nil)
+            }
         case .beacons:
             menuRow("beacons", "Manage Beacons", "antenna.radiowaves.left.and.right", Color(red: 0.78, green: 0.48, blue: 0.72))
             menuRow("beacon-profiles", "Trust Profiles", "folder.badge.plus", .purple)
@@ -1818,7 +2078,15 @@ struct Dashboard: View {
                 } else if let beacon = model.beacons.first(where: { "beacon:" + $0.id.uuidString == model.selection }) {
                     beaconDetailPage(beacon)
                 } else if let device = model.devices.first(where: { $0.id == model.selection }) {
-                    DeviceBrowser(device: device, onRename: renameReport).id(device.id)
+                    if model.servers.contains(where: { $0.id == device.id }) || device.id.hasPrefix("server-history:") {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Button("Servers", systemImage: "chevron.left") { openPage("servers") }
+                                .wardGlassButton().padding(.horizontal, 24).padding(.top, 32)
+                            DeviceBrowser(device: device).id(device.id)
+                        }
+                    } else {
+                        DeviceBrowser(device: device, onRename: renameReport).id(device.id)
+                    }
                 } else {
                     ContentUnavailableView("Ready to scan", systemImage: "laptopcomputer.and.arrow.down",
                                            description: Text("Scan this Mac or import a server’s report.json."))
@@ -1860,21 +2128,7 @@ struct Dashboard: View {
     }
 
     private var serversPage: some View {
-        beaconPage {
-            HStack(spacing: 20) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Servers").font(.largeTitle.weight(.semibold))
-                    Text("Set up a Ward agent on a server and verify delivery of its encrypted reports.")
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                BannerAction(title: "Connect a Server…", symbol: "server.rack", tint: .mint) {
-                    connectingServer = true
-                }
-            }
-            .padding(24)
-            .wardBanner(tint: .mint)
-        }
+        ServersDashboard(model: model, connect: { connectingServer = true })
     }
 
     private var beaconsPage: some View {
@@ -1994,7 +2248,7 @@ struct Dashboard: View {
                         Task { await model.refresh(beacon) }
                     }
                     .wardGlassButton()
-                    .disabled(model.busy)
+                    .disabled(model.busy || model.syncingServerReports)
                 }
             }
             .padding(18)
@@ -2281,7 +2535,7 @@ struct Dashboard: View {
         if LocalRoute.isLocal(tag) { return .mac }
         if tag == "imports" || tag.hasPrefix("import:") { return .reports }
         if tag == "database" { return .data }
-        if tag == "servers" { return .servers }
+        if tag == "servers" || tag.hasPrefix("server-history:") || model.servers.contains(where: { $0.id == tag }) { return .servers }
         if tag == "beacons" || tag == "beacon-profiles" || tag.hasPrefix("beacon:") { return .beacons }
         if model.devices.contains(where: { $0.id == tag }) { return .reports }
         return nil
@@ -2451,12 +2705,205 @@ struct BeaconProfile: Identifiable {
     }
 }
 
+private struct ServersDashboard: View {
+    @ObservedObject var model: WardModel
+    let connect: () -> Void
+    @State private var query = ""
+    @State private var onlyAttention = false
+    @State private var expanded: Set<String> = []
+
+    private var sources: [Beacon] { model.beacons.filter { !$0.relay.isEmpty } }
+    private func syncError(_ server: ServerRecord) -> String? {
+        let relay = model.serverCatalog.relays[server.beaconID.uuidString]
+        return server.error ?? (relay?.connectionFailed == true ? relay?.error : nil)
+    }
+    private func status(_ server: ServerRecord, at now: Date) -> (String, Color) {
+        if syncError(server) != nil { return ("Sync error", .orange) }
+        if server.stale(at: now) { return ("Report overdue", .orange) }
+        return ("Report current", .mint)
+    }
+    private func sourceName(_ server: ServerRecord) -> String {
+        model.beacons.first { $0.id == server.beaconID }?.name ?? "Relay"
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    HStack(spacing: 20) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Servers").font(.largeTitle.weight(.semibold))
+                            Text("Encrypted reports, delivery status, and scan history.").foregroundStyle(.secondary)
+                            Text("\(model.servers.count) servers · \(model.servers.filter { $0.stale(at: context.date) || syncError($0) != nil }.count) need attention")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                        BannerAction(title: model.syncingServerReports ? "Syncing…" : "Sync reports", symbol: "arrow.triangle.2.circlepath", tint: .mint) {
+                            Task { await model.syncServerReports() }
+                        }.disabled(model.syncingServerReports || sources.isEmpty)
+                        BannerAction(title: "Connect a Server…", symbol: "server.rack", tint: .mint, action: connect)
+                    }.padding(24).wardBanner(tint: .mint)
+
+                    HStack {
+                        Toggle("Automatic sync", isOn: $model.automaticServerSync).toggleStyle(.switch)
+                        Spacer()
+                        Text("Every 5 minutes while Ward is running").font(.caption).foregroundStyle(.secondary)
+                    }.padding(14).wardGlass(radius: 14)
+                    if !model.serverStorageError.isEmpty {
+                        Label(model.serverStorageError, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange).textSelection(.enabled)
+                    }
+                    ForEach(sources) { beacon in
+                        let state = model.serverCatalog.relays[beacon.id.uuidString]
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: state?.error == nil ? "antenna.radiowaves.left.and.right" : "exclamationmark.triangle")
+                                .foregroundStyle(state?.error == nil ? Color.mint : Color.orange)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(beacon.name).font(.callout.weight(.semibold))
+                                if let error = state?.error {
+                                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                                }
+                                if let date = state?.lastSuccess {
+                                    Text("Last successful sync · " + date.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                } else {
+                                    Text(model.syncingServerReports ? "Connecting…" : "No successful sync yet")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                if state?.lastSuccess != nil && !model.servers.contains(where: { $0.beaconID == beacon.id }) {
+                                    Text("Waiting for the first server report.").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                        }.padding(14).frame(maxWidth: .infinity, alignment: .leading).wardGlass(radius: 14)
+                    }
+                    if model.servers.isEmpty {
+                        VStack(spacing: 12) {
+                            Image(systemName: "server.rack").font(.system(size: 36)).foregroundStyle(.mint)
+                            Text("Your servers will appear here").font(.title3.bold())
+                            Text(sources.isEmpty ? "Connect a server and configure its report relay." : "Reports appear after the first scan is delivered and synced.")
+                                .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            Button("Connect a Server…", action: connect).wardGlassButton(prominent: true)
+                        }.frame(maxWidth: .infinity).padding(32).wardGlass(radius: 20)
+                    } else {
+                        HStack(spacing: 12) {
+                            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                            TextField("Search servers, systems or relays", text: $query).textFieldStyle(.plain)
+                        }.padding(12).wardGlass(radius: 12)
+                        HStack(spacing: 10) {
+                            Button("All servers") { onlyAttention = false }.wardGlassButton(prominent: !onlyAttention)
+                            Button("Needs attention") { onlyAttention = true }.wardGlassButton(prominent: onlyAttention)
+                        }
+                        let visible = model.servers.filter { server in
+                            let matches = query.isEmpty || [server.name, server.serverID, sourceName(server), server.latest?.system ?? ""]
+                                .contains { $0.localizedCaseInsensitiveContains(query) }
+                            return matches && (!onlyAttention || server.stale(at: context.date) || syncError(server) != nil)
+                        }
+                        if visible.isEmpty { Text("No servers match this filter.").foregroundStyle(.secondary) }
+                        ForEach(visible) { server in serverCard(server, now: context.date) }
+                    }
+                    Text("History: up to 20 received reports per server, 256 MiB total. Identical reports are saved once. Relay currently exposes the latest report; scans overwritten between syncs cannot be recovered.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 24)
+            }
+        }
+    }
+
+    private func serverCard(_ server: ServerRecord, now: Date) -> some View {
+        let state = status(server, at: now)
+        let open = expanded.contains(server.id)
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                if open { expanded.remove(server.id) } else { expanded.insert(server.id) }
+            } label: {
+                HStack(alignment: .center, spacing: 14) {
+                    Image(systemName: "server.rack").font(.title2).foregroundStyle(.mint)
+                        .frame(width: 48, height: 48).background(Color.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(server.name).font(.title3.bold())
+                        Text(server.serverID + " · " + sourceName(server)).font(.caption).foregroundStyle(.secondary)
+                        if let latest = server.latest {
+                            Text(latest.system ?? "System information unavailable").font(.callout).foregroundStyle(.secondary)
+                            Text("Last report · " + latest.generatedAt.formatted(date: .abbreviated, time: .shortened))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .trailing, spacing: 8) {
+                        Text(state.0).font(.caption.weight(.semibold)).foregroundStyle(state.1)
+                        Text("\(server.latest?.findings ?? 0) findings · \(server.latest?.review ?? 0) to review")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Image(systemName: open ? "chevron.up" : "chevron.down").foregroundStyle(.secondary)
+                    }
+                }.padding(18).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }.buttonStyle(.plain).wardPointer()
+            if let error = syncError(server) {
+                Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    .padding(.horizontal, 18).padding(.bottom, 12)
+            }
+            if ["partial", "incomplete"].contains(server.latest?.status ?? "") {
+                Label("Scan coverage is incomplete. Review Coverage in the report.", systemImage: "exclamationmark.circle")
+                    .font(.caption).foregroundStyle(.orange).padding(.horizontal, 18).padding(.bottom, 12)
+            }
+            HStack {
+                Text("\(server.snapshots.count) saved reports").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if let latest = server.latest {
+                    Button("Open latest", systemImage: "doc.text") { Task { await model.openServerReport(server, snapshot: latest) } }
+                        .wardGlassButton(prominent: true)
+                }
+            }.padding(.horizontal, 18).padding(.bottom, 14)
+            if open {
+                Divider().padding(.horizontal, 18)
+                VStack(alignment: .leading, spacing: 12) {
+                    Picker("Expected scan interval", selection: Binding(get: { server.expectedInterval }, set: { model.setServerInterval(server, seconds: $0) })) {
+                        Text("15 minutes").tag(TimeInterval(900))
+                        Text("1 hour").tag(TimeInterval(3600))
+                        Text("6 hours").tag(TimeInterval(21600))
+                        Text("24 hours").tag(TimeInterval(86400))
+                    }.fixedSize(horizontal: true, vertical: false)
+                    Text("Marked overdue after two missed intervals. This does not change the agent schedule.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Report history").font(.headline)
+                    ForEach(server.snapshots) { snapshot in
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(snapshot.generatedAt.formatted(date: .abbreviated, time: .standard)).font(.callout.weight(.medium))
+                                Text("\(snapshot.findings) findings · \(snapshot.review) to review").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Open") { Task { await model.openServerReport(server, snapshot: snapshot) } }.wardGlassButton()
+                            Button("Save JSON…", systemImage: "square.and.arrow.down") { export(server, snapshot: snapshot) }.wardGlassButton()
+                        }.padding(12).wardGlass(radius: 12)
+                    }
+                }.padding(18)
+            }
+        }.wardGlass(radius: 18)
+    }
+
+    private func export(_ server: ServerRecord, snapshot: ServerSnapshot) {
+        Task {
+            do {
+                let (data, _) = try await model.serverArchive.read(server, snapshot: snapshot.id)
+                let panel = NSSavePanel()
+                panel.allowedContentTypes = [.json]
+                panel.nameFieldStringValue = server.serverID + "-" + String(snapshot.id.prefix(8)) + ".json"
+                guard await panel.begin() == .OK, let url = panel.url else { return }
+                try data.write(to: url, options: .atomic)
+            } catch { model.message = error.localizedDescription }
+        }
+    }
+}
+
 private struct ServerSetupWizard: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: WardModel
     let openReport: (String) -> Void
     @State private var beaconID: UUID?
     @State private var showingRelayGuide = false
+    @State private var relayGuideHostname = ""
+    @State private var relayGuidePort = "8444"
+    @State private var relayGuideExistingCheckout = false
+    @State private var relayGuideCertificate = ""
+    @State private var relayGuidePrivateKey = ""
     @State private var relayAddress = ""
     @State private var relayReadToken = ""
     @State private var relayConnected = false
@@ -2467,8 +2914,12 @@ private struct ServerSetupWizard: View {
     @State private var error = ""
     @State private var verified: (Device, Data)?
     @State private var interval = "1h"
+    @State private var enrollmentToken = ""
+    @State private var relayCAPath = ""
+    @State private var installationCommand: String?
+    @State private var commandExpiry: Date?
 
-    private let titles = ["Choose a connection", "Prepare the agent", "Verify delivery", "Enable periodic scans"]
+    private let titles = ["Choose a connection", "Install and connect", "Verify delivery"]
     private var source: Beacon? { model.beacons.first { $0.id == beaconID } }
     private var sourceReady: Bool {
         guard let source else { return false }
@@ -2491,8 +2942,7 @@ private struct ServerSetupWizard: View {
                     switch step {
                     case 0: connection
                     case 1: preparation
-                    case 2: verification
-                    default: scheduling
+                    default: verification
                     }
                     if !error.isEmpty {
                         Label(error, systemImage: "exclamationmark.triangle")
@@ -2507,14 +2957,13 @@ private struct ServerSetupWizard: View {
                 if step > 0 {
                     Button("Back") { step -= 1; error = "" }.wardGlassButton().disabled(checking)
                 }
-                if step < 3 {
+                if step < 2 {
                     Button("Next") {
-                        if step == 1 { started = Date(); verified = nil }
                         error = ""
                         step += 1
                     }
                     .wardGlassButton(prominent: true)
-                    .disabled(!sourceReady || !validID || (step == 2 && verified == nil) || checking)
+                    .disabled(!sourceReady || !validID || (step == 1 && installationCommand == nil) || checking)
                 } else if let verified {
                     Button("Open Report") { openReport(verified.0.id) }.wardGlassButton(prominent: true)
                 }
@@ -2549,6 +2998,10 @@ private struct ServerSetupWizard: View {
                 relayAddress = ""
                 relayReadToken = ""
                 relayConnected = false
+                installationCommand = nil
+                commandExpiry = nil
+                enrollmentToken = beaconID.flatMap { try? Vault.read($0.uuidString + ".enrollment") }
+                    .map { String(decoding: $0, as: UTF8.self) } ?? ""
                 error = ""
             }
             if let source, !sourceReady {
@@ -2588,52 +3041,72 @@ private struct ServerSetupWizard: View {
                     .foregroundStyle(.mint)
             }
             TextField("Server ID, e.g. prod-web-01", text: $serverID).textFieldStyle(.roundedBorder)
-            Text("Use the same ID in the relay and agent settings. Up to 64 characters: letters, digits, dots, underscores and hyphens.")
+                .onChange(of: serverID) { _, _ in installationCommand = nil; commandExpiry = nil; verified = nil }
+            Text("A unique ID for this server. Ward registers it with the relay automatically.")
                 .foregroundStyle(.secondary)
             Picker("Scan interval", selection: $interval) {
                 ForEach(["15m", "1h", "6h", "24h"], id: \.self) { Text($0).tag($0) }
-            }
+            }.onChange(of: interval) { _, _ in installationCommand = nil; commandExpiry = nil; verified = nil }
         }
     }
 
     private var relayGuide: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Set Up a Report Relay").font(.title.weight(.semibold))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-                .wardBanner(tint: .pink)
+        let command = ServerEnrollmentCommand.relaySetupCommand(hostname: relayGuideHostname,
+            port: relayGuidePort, existingCheckout: relayGuideExistingCheckout,
+            certificate: relayGuideCertificate, privateKey: relayGuidePrivateKey)
+        return VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Set Up a Report Relay").font(.title2.bold())
+                Text("Receives encrypted server reports.").foregroundStyle(.secondary)
+            }.padding(18).frame(maxWidth: .infinity, alignment: .leading).wardBanner(tint: .pink)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("1. Get the Ward source").font(.headline)
-                    Text("On the Linux relay host, use the clone URL supplied by your Ward administrator. If you already have the source checkout, open it and skip the clone.")
-                    snippet("""
-                        git clone '<WARD_REPOSITORY_URL>' shixpeer.ward
-                        cd shixpeer.ward
-                        """)
-                    Text("2. Enable startup after reboot").font(.headline)
-                    Text("On a Linux host with systemd, use the account that will run the relay. This command allows its user services to start at boot and keep running after you sign out.")
-                    snippet("sudo loginctl enable-linger \"$(id -un)\"")
-                    Text("3. Build and start the relay").font(.headline)
-                    Text("Run this from the checkout with Go and OpenSSL installed. Use the same server ID as in the wizard. Choose a port from 1024 to 65535 and enter the DNS hostname your Mac and agents use to reach the relay.")
-                    snippet("bash packaging/shixpeer-ward-prepare-relay.sh " + (validID ? serverID : "ward-test-01") + " 8444 relay.example.com")
-                    Text("The script generates a self-signed TLS certificate and private key, saves the settings in a systemd user service, and starts it. On first setup it generates separate reader and writer tokens. On subsequent runs it reuses the config. Add any new server ID to writer_tokens before onboarding its agent.")
-                    snippet("systemctl --user status shixpeer-ward-relay.service --no-pager")
-                    Text("4. Connect Ward to the relay").font(.headline)
-                    Text("Allow the chosen TCP port from your Mac and agents. Enter https://YOUR-RELAY-HOST:8444 in Ward, using the hostname on the certificate and the port you chose. For the generated certificate, securely copy only ~/.shixpeer.ward/relay-tls/relay.crt to your Mac and agents. Trust it in macOS Keychain for this hostname and set ca_file to its local path in the agent upload config.")
-                    Text("Read the private config in your SSH session. Paste reader_token into Ward and use the matching writer token in the agent configuration.")
-                    snippet("cat \"$HOME/.shixpeer.ward/relay.json\"")
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack {
+                        TextField("Relay hostname (relay.example.com)", text: $relayGuideHostname).textFieldStyle(.roundedBorder)
+                        TextField("Port", text: $relayGuidePort).textFieldStyle(.roundedBorder).frame(width: 90)
+                    }
+                    Text("Use the DNS name your Mac and servers can reach.").font(.caption).foregroundStyle(.secondary)
+                    Toggle("Repository already cloned", isOn: $relayGuideExistingCheckout)
+                    DisclosureGroup("Use my TLS certificate (optional)") {
+                        VStack(spacing: 8) {
+                            TextField("Certificate path on the server", text: $relayGuideCertificate).textFieldStyle(.roundedBorder)
+                            TextField("Private key path on the server", text: $relayGuidePrivateKey).textFieldStyle(.roundedBorder)
+                        }.padding(.top, 8)
+                    }.font(.callout)
+                    if let command {
+                        Text(relayGuideExistingCheckout ? "Run in the repository folder on the relay host." : "Paste into the relay host terminal.")
+                            .font(.callout)
+                        snippet(command)
+                    } else {
+                        Text("Enter a hostname and port (1024–65535). TLS paths must be supplied together.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    Label("Builds · sets up TLS and tokens · enables startup · checks HTTPS", systemImage: "checkmark.shield")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Requires Linux + systemd, Go 1.26.10+ and OpenSSL. sudo may be requested for startup.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Divider()
+                    Text("Then copy the printed URL and tokens into Ward.").font(.callout.weight(.medium))
+                    Text("For generated TLS, trust the public certificate on your Mac and select it when connecting an agent.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Agent installation also needs a current signed agent release on Beacon.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack {
                 Spacer()
                 Button("Done") { showingRelayGuide = false }
-                    .wardGlassButton(prominent: true)
-                    .keyboardShortcut(.cancelAction)
+                    .wardGlassButton(prominent: true).keyboardShortcut(.cancelAction)
             }
-        }
-        .padding(24)
-        .frame(width: 720, height: 640)
+        }.padding(24).frame(width: 680, height: 580)
+            .onAppear {
+                if relayGuideHostname.isEmpty,
+                   let address = URLComponents(string: source?.relay.isEmpty == false ? source!.relay : relayAddress),
+                   let host = address.host {
+                    relayGuideHostname = host
+                    relayGuidePort = String(address.port ?? 8444)
+                }
+            }
     }
 
     private func saveRelay(for beacon: Beacon) {
@@ -2653,37 +3126,71 @@ private struct ServerSetupWizard: View {
 
     @ViewBuilder private var preparation: some View {
         if let source {
-            Text("Install the Ward agent and its systemd service using your Beacon’s signed installer. Use the installer and feed-key fingerprints supplied by your Beacon administrator. If the agent is already installed, continue under its service account.")
-            snippet("sudo -iu shixpeer-ward-agent")
-            Text("On the relay, add a unique writer token under writer_tokens for \(serverID), then reload the relay configuration. Keep its reader token in Ward.")
-            snippet("""
-                ward="$HOME/.shixpeer.ward/bin/shixpeer-ward-agent"
-                "$ward" setup -feed-url \(shellQuote(source.feed.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/v1/manifest.json")) -trusted-key /path/to/feed.pub
-                "$ward" update
-                """)
-            Text("Use the trusted feed.pub on the server. For a private database CA, add -ca-file /path/to/beacon-ca.crt to setup.")
-            Text("Save this JSON as ~/.shixpeer.ward/report-upload.json with permissions 0600. Replace the writer token on the server.")
-            if let key = try? Vault.recipient().publicKey.rawRepresentation.base64EncodedString(),
-               let data = try? JSONSerialization.data(withJSONObject: [
-                    "url": source.relay, "server_id": serverID,
-                    "writer_token": "REPLACE_ON_SERVER", "recipient_public_key": key
-               ], options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
-                snippet(String(decoding: data, as: UTF8.self))
-            } else {
-                Text("Ward could not load the report encryption key.").foregroundStyle(.red)
+            Text("Run one command on a Linux server with systemd. It installs the signed agent, connects the relay and enables scans every " + interval + ".")
+                .foregroundStyle(.secondary)
+            Text("Requires Linux amd64/arm64, systemd, curl and OpenSSL. Other installed software is not updated.")
+                .font(.caption).foregroundStyle(.secondary)
+            SecureField("Relay enrollment token", text: $enrollmentToken).textFieldStyle(.roundedBorder)
+                .disabled(installationCommand != nil)
+            Text("Use the separate management token once; Ward keeps it in Keychain. It is never sent to the server.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Relay setup", systemImage: "questionmark.circle") { showingRelayGuide = true }.wardGlassButton()
+            HStack {
+                TextField("Relay CA certificate (optional for private TLS)", text: $relayCAPath).textFieldStyle(.roundedBorder)
+                Button("Choose…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = false
+                    panel.begin { result in if result == .OK { relayCAPath = panel.url?.path ?? "" } }
+                }.wardGlassButton()
+            }.disabled(installationCommand != nil)
+            Button(checking ? "Creating…" : (installationCommand == nil ? "Create installation command" : "Generate new command"), systemImage: "terminal") {
+                checking = true
+                error = ""
+                let requestedAt = Date()
+                Task {
+                    defer { checking = false }
+                    do {
+                        let result = try await model.createServerEnrollment(source, serverID: serverID, interval: interval,
+                            managementToken: enrollmentToken, relayCAPath: relayCAPath)
+                        installationCommand = result.0
+                        commandExpiry = result.1
+                        started = requestedAt
+                        verified = nil
+                    } catch { self.error = error.localizedDescription }
+                }
+            }.wardGlassButton(prominent: true).disabled(checking || enrollmentToken.utf8.count < 32)
+            if let command = installationCommand, let expiry = commandExpiry {
+                VStack(alignment: .leading, spacing: 12) {
+                    Button("Change settings") { installationCommand = nil; commandExpiry = nil; verified = nil }.wardGlassButton()
+                    Label("Installation command ready", systemImage: "checkmark.shield.fill").foregroundStyle(.mint)
+                    Text("Paste it into the server terminal. sudo will ask for permission. No configuration editing is needed.")
+                        .font(.callout)
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(context.date < expiry ? "Valid until " + expiry.formatted(date: .omitted, time: .standard) : "Expired — regenerate if not installed")
+                                .font(.caption).foregroundStyle(context.date < expiry ? Color.secondary : Color.orange)
+                            Button("Copy installation command", systemImage: "doc.on.doc") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(command, forType: .string)
+                            }.wardGlassButton(prominent: true).disabled(context.date >= expiry)
+                        }
+                    }
+                    Text("Includes a short-lived registration token. Do not share it. The first scan follows the initial database download.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    DisclosureGroup("View command") {
+                        ScrollView([.horizontal, .vertical]) {
+                            Text(command).font(.caption.monospaced()).textSelection(.enabled)
+                        }.frame(height: 120)
+                    }
+                }.padding(16).wardGlass(radius: 16)
             }
-            Text("If the relay uses a private CA, add ca_file to this JSON and make sure macOS trusts the relay certificate.")
-            Text("Continue before running the test scan so Ward can recognize a fresh report.")
         }
     }
 
     private var verification: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Run a fresh scan on the server, then verify that Ward can fetch and decrypt it.")
-            snippet("""
-                chmod 600 "$HOME/.shixpeer.ward/report-upload.json"
-                "$HOME/.shixpeer.ward/bin/shixpeer-ward-agent" scan -report-upload-config "$HOME/.shixpeer.ward/report-upload.json"
-                """)
+            Text("After the installation command finishes, verify the first report. The initial database download may take a few minutes.")
+                .foregroundStyle(.secondary)
             Button(checking ? "Checking…" : "Verify Report", systemImage: "checkmark.shield") {
                 guard let source else { return }
                 checking = true
@@ -2691,7 +3198,13 @@ private struct ServerSetupWizard: View {
                 error = ""
                 Task {
                     defer { checking = false }
-                    do { verified = try await model.verifyServerReport(source, id: serverID, since: started) }
+                    do {
+                        verified = try await model.verifyServerReport(source, id: serverID, since: started)
+                        if let server = model.servers.first(where: { $0.id == verified?.0.id }) {
+                            let seconds: TimeInterval = ["15m": 900, "1h": 3600, "6h": 21600, "24h": 86400][interval] ?? 3600
+                            model.setServerInterval(server, seconds: seconds)
+                        }
+                    }
                     catch { self.error = error.localizedDescription }
                 }
             }
@@ -2707,25 +3220,6 @@ private struct ServerSetupWizard: View {
         }
     }
 
-    private var scheduling: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Return to your administrative shell and open the service override. Adjust the paths below if you installed the agent under another account.")
-            snippet("sudo systemctl edit shixpeer-ward-agent")
-            Text("Paste this into the editor and save it.")
-            snippet("""
-                [Service]
-                ExecStart=
-                ExecStart=/home/shixpeer-ward-agent/.shixpeer.ward/bin/shixpeer-ward-agent run -feed-interval 1m -collect-interval \(interval) -report-upload-config /home/shixpeer-ward-agent/.shixpeer.ward/report-upload.json
-                """)
-            snippet("""
-                sudo systemctl enable --now shixpeer-ward-agent
-                sudo systemctl restart shixpeer-ward-agent
-                sudo systemctl status shixpeer-ward-agent --no-pager
-                """)
-            Text("To check scheduled delivery, return to Verify Report after the next run and compare the report timestamp.")
-        }
-    }
-
     private func snippet(_ text: String) -> some View {
         VStack(alignment: .trailing, spacing: 6) {
             Button("Copy", systemImage: "doc.on.doc") {
@@ -2737,10 +3231,6 @@ private struct ServerSetupWizard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12).wardGlass(radius: 12)
-    }
-
-    private func shellQuote(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private func saveReport(_ data: Data) {
@@ -3461,7 +3951,7 @@ struct DeviceBrowser: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     if isLocal {
                         MacScanButton(title: "Rescan", model: model)
-                    } else if let device {
+                    } else if let device, device.id.hasPrefix("import:") {
                         Button {
                             showingReportActions.toggle()
                         } label: {
@@ -3699,6 +4189,9 @@ private enum AppFilter: String, CaseIterable, Identifiable {
 }
 
 private enum AppUpdateChannel {
+    case installerMetadata([URL])
+    case productXML(URL)
+    case jetBrains(String, String)
     case appStore(String)
     case sparkle(URL)
     case electron(URL)
@@ -3712,9 +4205,10 @@ private enum AppUpdateChannel {
 
     var label: String {
         switch self {
+        case .jetBrains: return "JetBrains stable releases"
         case .appStore: return "Mac App Store"
         case .sparkle: return "Sparkle"
-        case .electron, .vscode, .plain: return "App updater"
+        case .electron, .vscode, .plain, .productXML, .installerMetadata: return "App updater"
         case .dockerDesktop: return "Docker Desktop updater"
         case .sparkleUnlisted: return "Sparkle feed is not in the app"
         case .system: return "Updates with macOS"
@@ -3732,6 +4226,20 @@ private struct AppUpdateRecord: Codable, Equatable, Sendable {
     var installed: String
 }
 
+private func currentlyNeedsAppUpdate(_ id: String, record: AppUpdateRecord) -> Bool {
+    guard record.newer, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id),
+          let info = NSDictionary(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
+          let version = (info["CFBundleShortVersionString"] as? String) ?? (info["CFBundleVersion"] as? String) else { return false }
+    if let order = versionOrder(version, record.reported) { return order == .orderedAscending }
+    return version == record.installed
+}
+
+private enum AppUpdateAlerts {
+    static func pending(_ results: [String: AppUpdateRecord], notified: [String: String]) -> [String: AppUpdateRecord] {
+        results.filter { $0.value.newer && !$0.value.reported.isEmpty && notified[$0.key] != $0.value.reported }
+    }
+}
+
 private struct AppUpdateCacheFile: Codable {
     var format: Int
     var checkedAt: TimeInterval
@@ -3741,7 +4249,9 @@ private struct AppUpdateCacheFile: Codable {
 private enum AppUpdateStore {
     static let ttl: TimeInterval = 3600
     static let format = 3
-    static let maxBytes = 120 * 1024 * 1024
+    static let maxBytes = 1_200 * 1024 * 1024
+    static let maxVendorArchive = 2_000_000_000
+    static let maxExpandedArchive: Int64 = 6_000_000_000
     static let maxDeveloperZip = 600 * 1024 * 1024
     static var file: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -3792,7 +4302,9 @@ private func appChannel(_ app: Report.Inventory.Application) -> AppUpdateChannel
           let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier) else {
         return app.identifier.isEmpty ? .none : .missing
     }
-    return ChannelMemo.shared.channel(for: bundle.path + "\t" + app.identifier) {
+    let info = bundle.appendingPathComponent("Contents/Info.plist")
+    let modified = (try? info.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0
+    return ChannelMemo.shared.channel(for: bundle.path + "\t" + app.identifier + "\t" + String(modified)) {
         discoveredChannel(app, bundle: bundle)
     }
 }
@@ -3808,6 +4320,7 @@ private func discoveredChannel(_ app: Report.Inventory.Application, bundle: URL)
         let executable = bundle.appendingPathComponent("Contents/Resources/cli-plugins/docker-desktop")
         return FileManager.default.isExecutableFile(atPath: executable.path) ? .dockerDesktop(executable) : .none
     }
+    if let channel = jetBrainsChannel(bundle, identifier: app.identifier) { return channel }
     if let feed = declaredSparkleFeed(bundle, plist: plist) {
         return .sparkle(feed)
     }
@@ -3817,8 +4330,13 @@ private func discoveredChannel(_ app: Report.Inventory.Application, bundle: URL)
     if let vscode = vscodeChannel(bundle) {
         return .vscode(vscode.0, vscode.1, vscode.2, vscode.3)
     }
+    if let feed = eclipseProductFeed(bundle) { return .productXML(feed) }
     if let plain = plainVersionFeed(bundle) {
         return .plain(plain)
+    }
+    if let executable = mainExecutable(bundle) {
+        let urls = NativeInstallerUpdates.candidates(executable: executable, arm: currentCPU() == "arm64")
+        if !urls.isEmpty { return .installerMetadata(urls) }
     }
     if plist?["SUPublicEDKey"] != nil || plist?["SUPublicDSAKeyFile"] != nil {
         return .sparkleUnlisted
@@ -3826,24 +4344,161 @@ private func discoveredChannel(_ app: Report.Inventory.Application, bundle: URL)
     return .none
 }
 
+private func jetBrainsChannel(_ bundle: URL, identifier: String) -> AppUpdateChannel? {
+    guard identifier.hasPrefix("com.jetbrains."),
+          identifier.range(of: "^[A-Za-z0-9.]+$", options: .regularExpression) != nil else { return nil }
+    var code: SecStaticCode?
+    var requirement: SecRequirement?
+    let expression = "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"2ZEFAR8TH3\""
+    guard SecStaticCodeCreateWithPath(bundle as CFURL, [], &code) == errSecSuccess,
+          SecRequirementCreateWithString(expression as CFString, [], &requirement) == errSecSuccess,
+          let code, let requirement, SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess else { return nil }
+
+    struct Product: Decodable { let productCode, version: String }
+    let url = bundle.appendingPathComponent("Contents/Resources/product-info.json")
+    guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+          size <= 2_000_000,
+          let data = try? Data(contentsOf: url), data.count <= 2_000_000,
+          let product = try? JSONDecoder().decode(Product.self, from: data),
+          product.productCode.range(of: "^[A-Z0-9]{2,12}$", options: .regularExpression) != nil,
+          versionOrder(product.version, product.version) != nil else { return nil }
+    return .jetBrains(product.productCode, product.version)
+}
+
 private func declaredSparkleFeed(_ bundle: URL, plist: NSDictionary?) -> URL? {
     if let feed = plist?["SUFeedURL"] as? String, let url = httpsUpdateURL(feed) {
         return url
     }
+    if let feed = packagedSparkleFeed(bundle, plist: plist) { return feed }
     return embeddedSparkleFeed(bundle)
 }
 
-private func electronFeed(_ bundle: URL) -> URL? {
-    let file = bundle.appendingPathComponent("Contents/Resources/app-update.yml")
-    guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
+private func boundedUpdateData(_ file: URL) -> Data? {
+    guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+          values.isRegularFile == true, let size = values.fileSize, size > 0, size <= 512_000,
+          let data = try? Data(contentsOf: file), data.count <= 512_000 else { return nil }
+    return data
+}
+
+// Only explicit updater configuration is authoritative. Package repositories
+// and homepages can describe dependencies or templates rather than the app.
+private func electronProviderFeed(_ configuration: [String: String]) -> URL? {
+    guard let provider = configuration["provider"] else { return nil }
+    let channel = configuration["channel"] ?? "latest"
+    guard channel.range(of: "^[A-Za-z0-9_-]{1,40}$", options: .regularExpression) != nil else { return nil }
+    if provider == "generic", let raw = configuration["url"], let base = httpsUpdateURL(raw) {
+        if ["yml", "yaml"].contains(base.pathExtension.lowercased()) { return base }
+        return base.appendingPathComponent(channel + "-mac.yml")
+    }
+    if provider == "github", configuration["private"] != "true",
+       let owner = configuration["owner"], let repo = configuration["repo"],
+       [owner, repo].allSatisfy({ $0.range(of: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$", options: .regularExpression) != nil && $0 != "." && $0 != ".." }),
+       channel == "latest" {
+        return URL(string: "https://github.com/" + owner + "/" + repo + "/releases/latest/download/latest-mac.yml")
+    }
+    return nil
+}
+
+private func electronConfigurationFeed(_ data: Data) -> URL? {
+    if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        // Installed electron-builder configuration or explicit publish metadata.
+        let publish = (object["build"] as? [String: Any])?["publish"] ?? object["publish"] ?? object
+        let entries = (publish as? [[String: Any]]) ?? (publish as? [String: Any]).map { [$0] } ?? []
+        for entry in entries {
+            let strings = entry.compactMapValues { value -> String? in
+                if let text = value as? String { return text }
+                if let boolean = value as? Bool { return boolean ? "true" : "false" }
+                return nil
+            }
+            if let feed = electronProviderFeed(strings) { return feed }
+        }
+        return nil
+    }
+    guard let text = String(data: data, encoding: .utf8) else { return nil }
+    var configuration: [String: String] = [:]
     for raw in text.split(separator: "\n") {
         let line = raw.trimmingCharacters(in: .whitespaces)
-        guard line.hasPrefix("url:") else { continue }
-        var value = String(line.dropFirst(4).trimmingCharacters(in: .whitespaces))
-        if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
-            value = String(value.dropFirst().dropLast())
+        guard !line.hasPrefix("#"), let colon = line.firstIndex(of: ":") else { continue }
+        let key = String(line[..<colon])
+        guard ["provider", "url", "owner", "repo", "channel", "private"].contains(key),
+              configuration[key] == nil else { continue }
+        var value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        if value.count >= 2 && ((value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+                               (value.hasPrefix("'") && value.hasSuffix("'"))) {
+            value.removeFirst()
+            value.removeLast()
         }
-        return httpsUpdateURL(String(value))
+        configuration[key] = value
+    }
+    return electronProviderFeed(configuration)
+}
+
+// Electron ASAR keeps package.json behind a bounded JSON index.
+// Read only that metadata member, without extracting or executing app code.
+private func asarPackageData(_ archive: URL) -> Data? {
+    guard let values = try? archive.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+          values.isRegularFile == true, let fileSize = values.fileSize, fileSize >= 16,
+          let handle = try? FileHandle(forReadingFrom: archive) else { return nil }
+    defer { try? handle.close() }
+    func read(_ count: Int) -> Data? {
+        guard let data = try? handle.read(upToCount: count), data.count == count else { return nil }
+        return data
+    }
+    guard let prefix = read(16) else { return nil }
+    func word(_ offset: Int) -> UInt64 {
+        (0..<4).reduce(UInt64(0)) { $0 | (UInt64(prefix[offset + $1]) << (8 * $1)) }
+    }
+    let headerBytes = word(4)
+    let jsonBytes = word(12)
+    guard word(0) == 4, headerBytes >= 8, headerBytes <= 8 * 1024 * 1024,
+          word(8) + 4 == headerBytes, jsonBytes > 0, jsonBytes <= headerBytes - 8,
+          8 + headerBytes <= UInt64(fileSize),
+          let raw = read(Int(jsonBytes)),
+          let header = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
+          let files = header["files"] as? [String: Any],
+          let member = files["package.json"] as? [String: Any],
+          member["link"] == nil, member["unpacked"] == nil,
+          let length = member["size"] as? NSNumber,
+          CFGetTypeID(length) != CFBooleanGetTypeID(),
+          let offsetText = member["offset"] as? String,
+          offsetText.range(of: "^[0-9]{1,18}$", options: .regularExpression) != nil,
+          let offset = UInt64(offsetText) else { return nil }
+    let size = length.doubleValue
+    guard size > 0, size <= 512_000, size.rounded() == size else { return nil }
+    let base = 8 + headerBytes
+    guard offset <= UInt64(fileSize) - base,
+          UInt64(size) <= UInt64(fileSize) - base - offset else { return nil }
+    do { try handle.seek(toOffset: base + offset) } catch { return nil }
+    return read(Int(size))
+}
+
+private func packagedSparkleFeed(_ bundle: URL, plist: NSDictionary?) -> URL? {
+    let data = asarPackageData(bundle.appendingPathComponent("Contents/Resources/app.asar"))
+        ?? boundedUpdateData(bundle.appendingPathComponent("Contents/Resources/app/package.json"))
+    guard let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let publicKey = plist?["SUPublicEDKey"] as? String else { return nil }
+    var feeds = Set<URL>()
+    for (key, value) in object {
+        let normalized = key.lowercased()
+        let suffix = "sparklefeedurl"
+        guard normalized.hasSuffix(suffix), let raw = value as? String,
+              let url = httpsUpdateURL(raw) else { continue }
+        let prefix = String(normalized.dropLast(suffix.count))
+        let keys = object.filter { $0.key.lowercased() == prefix + "sparklepublickey" }
+        guard keys.count == 1, keys.first?.value as? String == publicKey else { continue }
+        feeds.insert(url)
+    }
+    return feeds.count == 1 ? feeds.first : nil
+}
+
+private func electronFeed(_ bundle: URL) -> URL? {
+    for path in ["Contents/Resources/app-update.yml", "Contents/Resources/app-update.yaml",
+                 "Contents/Resources/app-update.json", "Contents/Resources/app/package.json"] {
+        if let data = boundedUpdateData(bundle.appendingPathComponent(path)),
+           let feed = electronConfigurationFeed(data) { return feed }
+    }
+    if let data = asarPackageData(bundle.appendingPathComponent("Contents/Resources/app.asar")) {
+        return electronConfigurationFeed(data)
     }
     return nil
 }
@@ -3863,6 +4518,8 @@ private func updateJobs(for applications: [Report.Inventory.Application]) -> [Ap
         let installed = liveVersion(app)
         guard !installed.isEmpty else { return nil }
         switch appChannel(app) {
+        case .jetBrains(let code, let version):
+            return AppUpdateJob(id: app.identifier, installed: version, target: .jetBrains(code))
         case .appStore(let id):
             return AppUpdateJob(id: app.identifier, installed: installed, target: .appStore(id))
         case .sparkle(let url):
@@ -3873,6 +4530,10 @@ private func updateJobs(for applications: [Report.Inventory.Application]) -> [Ap
             return AppUpdateJob(id: app.identifier, installed: installed, target: .electron(url))
         case .vscode(let base, let platform, let name, let quality):
             return AppUpdateJob(id: app.identifier, installed: installed, target: .vscode(base, platform, name, quality))
+        case .installerMetadata(let urls):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .installerMetadata(urls))
+        case .productXML(let url):
+            return AppUpdateJob(id: app.identifier, installed: installed, target: .productXML(url))
         case .plain(let url):
             return AppUpdateJob(id: app.identifier, installed: installed, target: .plain(url))
         case .dockerDesktop(let executable):
@@ -3883,8 +4544,75 @@ private func updateJobs(for applications: [Report.Inventory.Application]) -> [Ap
     }
 }
 
+private struct VendorPackage {
+    let version: String
+    let url: URL?
+    let size: Int?
+}
+
+private func installableVendorURL(_ raw: String) -> URL? {
+    guard let url = httpsUpdateURL(raw), archiveSuffix(url.path.lowercased()) != nil else { return nil }
+    return url
+}
+
+private func jetBrainsPackage(_ code: String) async throws -> VendorPackage {
+    guard code.range(of: "^[A-Z0-9]{2,12}$", options: .regularExpression) != nil else { throw URLError(.badURL) }
+    var parts = URLComponents(string: "https://data.services.jetbrains.com/products/releases")!
+    parts.queryItems = [URLQueryItem(name: "code", value: code), URLQueryItem(name: "type", value: "release"),
+                        URLQueryItem(name: "latest", value: "true")]
+    struct Download: Decodable { let link: String; let size: Int }
+    struct Release: Decodable { let version, type: String; let downloads: [String: Download] }
+    let releases = try JSONDecoder().decode([String: [Release]].self, from: await fetchHTTPS(parts.url!))
+    let stable = (releases[code] ?? []).filter { $0.type == "release" }
+    guard let version = newestComparable(stable.map(\.version)), let release = stable.first(where: { $0.version == version }) else {
+        throw URLError(.badServerResponse)
+    }
+    let architecture = currentCPU() == "arm64" ? "macM1" : "mac"
+    guard let archive = release.downloads[architecture], archive.size > 0,
+          archive.size <= AppUpdateStore.maxVendorArchive, let url = installableVendorURL(archive.link) else {
+        return VendorPackage(version: version, url: nil, size: nil)
+    }
+    return VendorPackage(version: version, url: url, size: archive.size)
+}
+
+private func electronPackage(_ base: URL) async throws -> VendorPackage {
+    let feed = ["yml", "yaml"].contains(base.pathExtension.lowercased()) ? base : base.appendingPathComponent("latest-mac.yml")
+    return try electronPackageMetadata(try await fetchHTTPS(feed), feed: feed)
+}
+
+private func electronPackageMetadata(_ data: Data, feed: URL) throws -> VendorPackage {
+    let text = String(decoding: data, as: UTF8.self)
+    var fields: [String: String] = [:]
+    for raw in text.split(separator: "\n") where !raw.hasPrefix(" ") && !raw.hasPrefix("\t") {
+        guard let colon = raw.firstIndex(of: ":") else { continue }
+        let key = String(raw[..<colon])
+        guard ["version", "path"].contains(key), fields[key] == nil else { continue }
+        var value = raw[raw.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        if value.count >= 2 && ((value.hasPrefix("\"") && value.hasSuffix("\"")) ||
+                               (value.hasPrefix("'") && value.hasSuffix("'"))) {
+            value.removeFirst(); value.removeLast()
+        }
+        fields[key] = value
+    }
+    guard let version = fields["version"], versionOrder(version, version) != nil else { throw URLError(.badServerResponse) }
+    let url = fields["path"].flatMap { resolveFeedURL($0, relativeTo: feed) }.flatMap { installableVendorURL($0.absoluteString) }
+    return VendorPackage(version: version, url: url, size: nil)
+}
+
+private func verifyDeveloperUpdate(_ app: URL, bundleID: String, team: String) throws {
+    guard team.range(of: "^[A-Z0-9]{10}$", options: .regularExpression) != nil,
+          bundleID.range(of: "^[A-Za-z0-9][A-Za-z0-9.-]*$", options: .regularExpression) != nil else {
+        throw WardError("The developer signature cannot be verified.")
+    }
+    let requirement = "anchor apple generic and identifier \"\(bundleID)\" and certificate leaf[subject.OU] = \"\(team)\""
+    try runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", "-R=" + requirement, app.path])
+}
+
 private struct AppUpdateJob: Sendable {
     enum Target: Sendable {
+        case installerMetadata([URL])
+        case productXML(URL)
+        case jetBrains(String)
         case appStore(String)
         case sparkle(URL, Bool)
         case electron(URL)
@@ -3899,6 +4627,13 @@ private struct AppUpdateJob: Sendable {
     func lookup() async -> AppUpdateRecord {
         do {
             switch target {
+            case .installerMetadata(let urls):
+                let version = try await NativeInstallerUpdates.version(urls, id: id)
+                return Self.record(channel: "its installer metadata", installed: installed, reported: version, canInstall: false)
+            case .jetBrains(let code):
+                let package = try await jetBrainsPackage(code)
+                return Self.record(channel: "JetBrains", installed: installed, reported: package.version,
+                                   canInstall: package.url != nil)
             case .appStore(let bundleID):
                 let reported = try await Self.appStoreVersion(bundleID)
                 return Self.record(channel: "the App Store", installed: installed, reported: reported, canInstall: false)
@@ -3909,13 +4644,18 @@ private struct AppUpdateJob: Sendable {
                 let installable = base.newer && hasKey && sparkleInstallableArchive(xml, version: reported, feed: url) != nil
                 return AppUpdateRecord(text: base.text, newer: base.newer, canInstall: installable, reported: reported, installed: installed)
             case .electron(let url):
-                let reported = try await Self.electronVersion(url)
-                return Self.record(channel: "its updater", installed: installed, reported: reported, canInstall: false)
+                let package = try await electronPackage(url)
+                return Self.record(channel: "its updater", installed: installed, reported: package.version,
+                                   canInstall: package.url != nil)
             case .vscode(let base, let platform, let name, let quality):
                 return try await Self.vscodeRecord(base: base, platform: platform, name: name, quality: quality, installed: installed)
             case .dockerDesktop(let executable):
                 let reported = try await Self.dockerDesktopVersion(executable)
                 return Self.record(channel: "Docker Desktop", installed: installed, reported: reported, canInstall: false)
+            case .productXML(let url):
+                let data = try await fetchHTTPS(url)
+                guard let reported = productXMLVersion(data) else { throw URLError(.badServerResponse) }
+                return Self.record(channel: "its product update feed", installed: installed, reported: reported, canInstall: false)
             case .plain(let url):
                 let reported = try await Self.plainVersion(url)
                 return Self.record(channel: "its updater", installed: installed, reported: reported, canInstall: false)
@@ -3923,10 +4663,11 @@ private struct AppUpdateJob: Sendable {
         } catch {
             let text: String
             switch target {
+            case .jetBrains: text = "JetBrains release check failed"
             case .appStore: text = "App Store check failed"
             case .dockerDesktop: text = "Docker Desktop update check failed"
             case .sparkle: text = "Sparkle feed could not be read"
-            case .electron, .vscode, .plain: text = "Updater feed could not be read"
+            case .electron, .vscode, .plain, .productXML, .installerMetadata: text = "Updater feed could not be read"
             }
             return AppUpdateRecord(text: text, newer: false, canInstall: false, reported: "", installed: installed)
         }
@@ -4008,30 +4749,6 @@ private struct AppUpdateJob: Sendable {
             throw URLError(.badServerResponse)
         }
         return version
-    }
-
-    private static func electronVersion(_ base: URL) async throws -> String {
-        let ext = base.pathExtension.lowercased()
-        let feed: URL
-        if ext == "yml" || ext == "yaml" {
-            feed = base
-        } else {
-            var root = base.absoluteString
-            if root.hasSuffix("/") { root.removeLast() }
-            guard let url = httpsUpdateURL(root + "/latest-mac.yml") else { throw URLError(.badURL) }
-            feed = url
-        }
-        let text = String(decoding: try await fetchHTTPS(feed), as: UTF8.self)
-        for raw in text.split(separator: "\n") {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("version:") else { continue }
-            var value = line.dropFirst("version:".count).trimmingCharacters(in: .whitespaces)
-            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 { value.removeFirst(); value.removeLast() }
-            if value.hasPrefix("'"), value.hasSuffix("'"), value.count >= 2 { value.removeFirst(); value.removeLast() }
-            guard !value.isEmpty else { continue }
-            return String(value)
-        }
-        throw URLError(.badServerResponse)
     }
 
     private static func vscodeRecord(base: URL, platform: String, name: String, quality: String, installed: String) async throws -> AppUpdateRecord {
@@ -4370,6 +5087,104 @@ private func currentCPU() -> String {
     #endif
 }
 
+// Reads the active Eclipse product declaration, never plugin update repositories.
+private func eclipseProductFeed(_ bundle: URL) -> URL? {
+    let root = bundle.appendingPathComponent("Contents/Eclipse")
+    guard let data = boundedUpdateData(root.appendingPathComponent("configuration/config.ini")),
+          let text = String(data: data, encoding: .utf8) else { return nil }
+    let products = text.split(separator: "\n").compactMap { line -> String? in
+        let parts = line.split(separator: "=", maxSplits: 1)
+        guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "eclipse.product" else { return nil }
+        return parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    guard products.count == 1, let product = products.first,
+          product.range(of: "^[A-Za-z0-9_.-]{1,240}$", options: .regularExpression) != nil,
+          let dot = product.lastIndex(of: ".") else { return nil }
+    let plugin = String(product[..<dot])
+    let extensionID = String(product[product.index(after: dot)...])
+    let directory = root.appendingPathComponent("plugins")
+    guard let entries = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return nil }
+    let candidates = entries.filter { $0.lastPathComponent.hasPrefix(plugin + "_") && $0.pathExtension == "jar" }
+    guard candidates.count == 1, let archive = candidates.first,
+          let xml = zipMetadata(archive, member: "plugin.xml") else { return nil }
+    let delegate = ProductMetadataParser(extensionID: extensionID)
+    let parser = XMLParser(data: xml)
+    parser.shouldResolveExternalEntities = false
+    parser.delegate = delegate
+    guard parser.parse(), delegate.feeds.count == 1 else { return nil }
+    return delegate.feeds.first.flatMap(httpsUpdateURL)
+}
+
+private func zipMetadata(_ archive: URL, member: String) -> Data? {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+    process.arguments = ["-p", archive.path, member]
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do { try process.run() } catch { return nil }
+    pipe.fileHandleForWriting.closeFile()
+    let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: timeout)
+    defer { timeout.cancel() }
+    let data = pipe.fileHandleForReading.readData(ofLength: 512_001)
+    if data.count > 512_000 {
+        if process.isRunning { process.terminate() }
+        pipe.fileHandleForReading.closeFile()
+        process.waitUntilExit()
+        return nil
+    }
+    process.waitUntilExit()
+    return process.terminationStatus == 0 ? data : nil
+}
+
+private final class ProductMetadataParser: NSObject, XMLParserDelegate {
+    let extensionID: String
+    var feeds: [String] = []
+    private var active = false
+    init(extensionID: String) { self.extensionID = extensionID }
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes: [String: String]) {
+        if elementName == "extension" {
+            active = attributes["point"] == "org.eclipse.core.runtime.products" && attributes["id"] == extensionID
+        }
+        if active && elementName == "property" && attributes["name"] == "versionUpdateURL",
+           let value = attributes["value"] { feeds.append(value) }
+    }
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        if elementName == "extension" { active = false }
+    }
+}
+
+private func productXMLVersion(_ data: Data) -> String? {
+    let delegate = ProductVersionParser()
+    let parser = XMLParser(data: data)
+    parser.shouldResolveExternalEntities = false
+    parser.delegate = delegate
+    guard parser.parse(), delegate.versions.count == 1, let value = delegate.versions.first,
+          versionOrder(value, value) != nil else { return nil }
+    return value
+}
+
+private final class ProductVersionParser: NSObject, XMLParserDelegate {
+    var versions: [String] = []
+    private var elements: [String] = []
+    private var number = ""
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes: [String: String]) {
+        elements.append(elementName)
+        if elements == ["version", "number"] { number = "" }
+    }
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if elements == ["version", "number"] { number += string }
+    }
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        if elements == ["version", "number"] { versions.append(number.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if !elements.isEmpty { elements.removeLast() }
+    }
+}
+
 private func plainVersionFeed(_ bundle: URL) -> URL? {
     guard let file = mainExecutable(bundle) else { return nil }
     guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
@@ -4432,7 +5247,54 @@ private func xmlAttribute(_ tag: String, _ name: String) -> String? {
     return value.isEmpty ? nil : String(value)
 }
 
-private func downloadHTTPS(_ url: URL, maxBytes: Int) async throws -> URL {
+private final class ArchiveDownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    let maximum: Int64
+    let progress: (@MainActor @Sendable (Int64, Int64) -> Void)?
+    private var lastUpdate = Date.distantPast
+    var completion: CheckedContinuation<(URL, URLResponse), Error>?
+    private var downloaded: URL?
+    private var downloadError: Error?
+
+    init(maximum: Int, progress: (@MainActor @Sendable (Int64, Int64) -> Void)?) {
+        self.maximum = Int64(maximum)
+        self.progress = progress
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        do {
+            try FileManager.default.moveItem(at: location, to: destination)
+            downloaded = destination
+        } catch { downloadError = error }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error ?? downloadError {
+            if let downloaded { try? FileManager.default.removeItem(at: downloaded) }
+            completion?.resume(throwing: error)
+        } else if let downloaded, let response = task.response {
+            completion?.resume(returning: (downloaded, response))
+        } else { completion?.resume(throwing: URLError(.badServerResponse)) }
+        completion = nil
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesWritten <= maximum, totalBytesExpectedToWrite <= maximum else {
+            downloadTask.cancel()
+            return
+        }
+        guard Date().timeIntervalSince(lastUpdate) >= 0.15 || totalBytesWritten == totalBytesExpectedToWrite else { return }
+        lastUpdate = Date()
+        let callback = progress
+        Task { @MainActor in callback?(totalBytesWritten, max(0, totalBytesExpectedToWrite)) }
+    }
+}
+
+private func downloadHTTPS(_ url: URL, maxBytes: Int,
+                           progress: (@MainActor @Sendable (Int64, Int64) -> Void)? = nil) async throws -> URL {
     guard url.scheme?.lowercased() == "https", maxBytes > 0 else { throw URLError(.badURL) }
     var request = URLRequest(url: url, timeoutInterval: 120)
     request.setValue("shixpeer-ward", forHTTPHeaderField: "User-Agent")
@@ -4440,9 +5302,13 @@ private func downloadHTTPS(_ url: URL, maxBytes: Int) async throws -> URL {
     configuration.timeoutIntervalForRequest = 60
     configuration.timeoutIntervalForResource = 900
     configuration.waitsForConnectivity = false
-    let session = URLSession(configuration: configuration)
+    let delegate = ArchiveDownloadProgress(maximum: maxBytes, progress: progress)
+    let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
     defer { session.finishTasksAndInvalidate() }
-    let (temp, response) = try await session.download(for: request)
+    let (temp, response) = try await withCheckedThrowingContinuation { continuation in
+        delegate.completion = continuation
+        session.downloadTask(with: request).resume()
+    }
     guard let http = response as? HTTPURLResponse,
           (200..<300).contains(http.statusCode),
           response.url?.scheme?.lowercased() == "https" else {
@@ -4479,7 +5345,14 @@ private func unpackArchive(_ file: URL, to root: URL, maxUnpacked: Int64) throws
 private func unpackDMG(_ file: URL, to root: URL, maxUnpacked: Int64) throws {
     let mount = try mountDMG(file)
     defer { detachDMG(mount) }
-    try runTool("/usr/bin/ditto", [mount.path, root.path])
+    let entries = try FileManager.default.contentsOfDirectory(at: mount, includingPropertiesForKeys: [.isSymbolicLinkKey])
+    let apps = entries.filter { $0.pathExtension == "app" }
+    guard apps.count == 1, let app = apps.first,
+          try app.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+        throw WardError("The disk image must contain one application bundle.")
+    }
+    try rejectArchiveLayout(app, maxUnpacked: maxUnpacked)
+    try runTool("/usr/bin/ditto", [app.path, root.appendingPathComponent(app.lastPathComponent).path])
     try rejectArchiveLayout(root, maxUnpacked: maxUnpacked)
 }
 
@@ -4617,7 +5490,12 @@ private func newestComparable(_ versions: [String]) -> String? {
 
 private func versionOrder(_ lhs: String, _ rhs: String) -> ComparisonResult? {
     func parts(_ raw: String) -> [Int]? {
-        let pieces = raw.split(separator: ".", omittingEmptySubsequences: false)
+        var release = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Some Sparkle short versions append a parenthesized numeric build.
+        if let suffix = release.range(of: #"\s*\([0-9]+\)$"#, options: .regularExpression) {
+            release.removeSubrange(suffix)
+        }
+        let pieces = release.split(separator: ".", omittingEmptySubsequences: false)
         guard !pieces.isEmpty, pieces.count <= 8 else { return nil }
         var numbers: [Int] = []
         for piece in pieces {
@@ -4659,6 +5537,7 @@ private struct FixRequest: Identifiable {
 private enum AppInstallKind {
     case sparkle
     case developerZip
+    case vendorArchive
 }
 
 private struct AppInstallRequest: Identifiable {
@@ -4697,6 +5576,9 @@ private struct DeviceSectionBanner: View {
     var actionTitle = ""
     var actionDisabled = false
     var action: (() -> Void)?
+    var secondaryTitle = ""
+    var secondaryDisabled = false
+    var secondaryAction: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 20) {
@@ -4710,6 +5592,10 @@ private struct DeviceSectionBanner: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            if let secondaryAction {
+                BannerAction(title: secondaryTitle, symbol: "arrow.down.circle", tint: page.tint, action: secondaryAction)
+                    .disabled(secondaryDisabled)
+            }
             if let action {
                 BannerAction(title: actionTitle, symbol: page.symbol, tint: page.tint, action: action)
                     .disabled(actionDisabled)
@@ -4784,8 +5670,18 @@ struct ReportView: View {
     }
     private var checkingUpdates: Bool { model.checkingAppVersions }
     private var updateNote: String { model.applicationUpdateNote }
+    private struct AppUpdateBatch: Identifiable {
+        let id = UUID()
+        let requests: [AppInstallRequest]
+    }
+    @State private var appUpdateBatch: AppUpdateBatch?
+    @State private var updateAllResults: [String: String] = [:]
+    @State private var stopUpdateAll = false
     @State private var appInstall: AppInstallRequest?
     @State private var installLog = ""
+    @State private var installStage = ""
+    @State private var installBytes: Int64 = 0
+    @State private var installTotal: Int64 = 0
     @State private var installMessage = ""
     private var installing: Bool { model.installingApplication }
     @State private var packageFilter: PackageFilter = .all
@@ -4832,7 +5728,10 @@ struct ReportView: View {
             if page == .applications && device.id == "local" {
                 DeviceSectionBanner(page: page, subtitle: subtitle, status: updateNote,
                                     actionTitle: checkingUpdates ? "Checking…" : "Check updates",
-                                    actionDisabled: checkingUpdates || installing || model.busy, action: { checkNewerVersions(showProgress: true) })
+                                    actionDisabled: checkingUpdates || installing || model.busy, action: { checkNewerVersions(showProgress: true) },
+                                    secondaryTitle: "Update all",
+                                    secondaryDisabled: availableInstallRequests.isEmpty || checkingUpdates || installing || model.busy,
+                                    secondaryAction: presentAllAppUpdates)
                     .padding(.bottom, 8)
             } else if page == .findings && device.id == "local" && !fixableIDs.isEmpty {
                 DeviceSectionBanner(page: page, subtitle: subtitle, actionTitle: "Fix",
@@ -5502,69 +6401,81 @@ struct ReportView: View {
             }
             refreshApplicationUpdatesIfNeeded()
         }
+        .sheet(item: $appUpdateBatch) { batch in
+            applicationUpdateSheet(batch.requests, batch: true)
+        }
         .sheet(item: $appInstall) { request in
-            let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID)
-            let destination = installed?.path ?? "The app is no longer installed."
-            let needsAdmin = installed.map { !canReplaceInstalledApp($0) } ?? false
-            let canUpdate = installed.map { canReplaceInstalledApp($0) || supportsAdminReplacement($0) } ?? false
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Update \(request.name)").font(.title2.bold())
-                Text(request.kind == .sparkle
-                     ? "Ward downloads the archive from the Sparkle feed inside this app, checks its Ed25519 signature against the key shipped in the app, and replaces the installed copy. The file stays on this Mac."
-                     : "Ward downloads the zip from the update address written in this app. It replaces the installed copy only when the new app has the same identifier and is signed by the same developer. The file stays on this Mac.")
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("\(request.fromVersion) → \(request.toVersion)").font(.callout.monospaced()).textSelection(.enabled)
-                Text(destination).font(.caption.monospaced()).textSelection(.enabled)
-                if canUpdate {
-                    Text("Ward will ask \(request.name) to quit before installing. Save your work first. If it was running, Ward will reopen it after a successful update.")
-                        .font(.callout)
-                } else if installed != nil {
-                    Label("Ward cannot replace this copy with your current permissions. Open \(request.name) to update it there.",
-                          systemImage: "lock.fill")
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                }
-                if canUpdate && needsAdmin {
-                    Label("macOS will ask for administrator approval to replace this application.",
-                          systemImage: "lock.fill")
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                }
-                HStack {
-                    Button("Close") { appInstall = nil }.wardGlassButton().disabled(installing)
-                    Spacer()
-                    if canUpdate {
-                        Button(installing ? "Updating…" : needsAdmin ? "Update with Approval…" : "Update") { runAppUpdate(request) }
-                            .wardGlassButton(prominent: true)
-                            .disabled(installing)
-                    } else if let installed {
-                        Button("Open \(request.name)") {
-                            Task {
-                                do {
-                                    _ = try await NSWorkspace.shared.openApplication(at: installed, configuration: .init())
-                                } catch {
-                                    installMessage = error.localizedDescription
-                                }
+            applicationUpdateSheet([request], batch: false)
+        }
+    }
+
+    private func applicationUpdateSheet(_ requests: [AppInstallRequest], batch: Bool) -> some View {
+        let running = requests.contains { updateButtonTitle($0.bundleID) != "Update" }
+        let canUpdate = !requests.isEmpty && requests.allSatisfy { request in
+            guard let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID) else { return false }
+            return canReplaceInstalledApp(installed) || supportsAdminReplacement(installed)
+        }
+        return VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Update applications").font(.title2.bold())
+                Text(running ? "Save your work. Open apps will quit and reopen." : "Install the latest verified versions.")
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
+            }.frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52, alignment: .topLeading)
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach(requests) { request in
+                        HStack(spacing: 12) {
+                            Image(nsImage: applicationIcon(request.bundleID))
+                                .resizable().frame(width: 40, height: 40)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(request.name).font(.headline)
+                                Text("\(request.fromVersion) → \(request.toVersion)")
+                                    .font(.callout.monospaced()).foregroundStyle(.secondary)
+                                Text(updateAllResults[request.bundleID] ?? "Ready")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                    .frame(height: 30, alignment: .topLeading).textSelection(.enabled)
                             }
-                        }
-                        .wardGlassButton(prominent: true)
+                            Spacer(minLength: 0)
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(14).wardGlass(radius: 12)
+                    }
+                    if !installLog.isEmpty {
+                        DisclosureGroup("Details") {
+                            Text(installLog).font(.caption.monospaced()).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                        }.font(.callout).padding(.horizontal, 4)
                     }
                 }
-                if installing { ProgressView("Updating application").controlSize(.small) }
-                if !installLog.isEmpty {
-                    Text("Update log").font(.subheadline.bold())
-                    ScrollView {
-                        Text(installLog).font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                    }.frame(height: 160).wardGlass(radius: 12)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            ZStack(alignment: .leading) {
+                applicationInstallProgress
+                    .opacity(installing || !updateAllResults.isEmpty ? 1 : 0)
+                    .accessibilityHidden(!installing && updateAllResults.isEmpty)
+                if !canUpdate && !installing {
+                    Label("Update this app in the app itself.", systemImage: "lock.fill")
+                        .font(.callout).foregroundStyle(.orange)
                 }
-                if !installMessage.isEmpty { Text(installMessage).foregroundStyle(.secondary).textSelection(.enabled) }
-            }
-            .padding(24).frame(width: 560)
+            }.frame(height: 44)
+            HStack {
+                Button("Close") { appUpdateBatch = nil; appInstall = nil }
+                    .wardGlassButton().disabled(installing)
+                Spacer()
+                if installing {
+                    if requests.count > 1 {
+                        Button(stopUpdateAll ? "Stopping…" : "Stop after this app") { stopUpdateAll = true }
+                            .wardGlassButton().disabled(stopUpdateAll)
+                    }
+                } else {
+                    Button(batch ? "Update all" : updateButtonTitle(requests.first?.bundleID ?? "")) {
+                        runAllAppUpdates(requests)
+                    }.wardGlassButton(prominent: true)
+                        .disabled(!canUpdate || requests.allSatisfy { updateAllResults[$0.bundleID] != nil })
+                }
+            }.frame(height: 32)
+        }.padding(20).frame(width: 580, height: 188 + min(230, max(100, CGFloat(requests.count) * 96 + 26)))
+            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.10, blue: 0.28),
+                                                Color(red: 0.07, green: 0.06, blue: 0.14)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing))
             .interactiveDismissDisabled(installing)
-        }
     }
 
     private var filteredApplications: [Report.Inventory.Application] {
@@ -5604,7 +6515,7 @@ struct ReportView: View {
         if updateChecks[app.identifier] != nil { return false }
         switch appChannel(app) {
         case .sparkleUnlisted, .none, .missing: return true
-        case .appStore, .sparkle, .electron, .vscode, .plain, .dockerDesktop, .system: return false
+        case .jetBrains, .appStore, .sparkle, .electron, .vscode, .plain, .productXML, .installerMetadata, .dockerDesktop, .system: return false
         }
     }
 
@@ -5622,7 +6533,7 @@ struct ReportView: View {
         let canInstall = device.id == "local" && record?.canInstall == true && record?.reported.isEmpty == false
         let versionIsBuild = app.versionKind == "build"
         let scanVersionDiffers = !app.version.isEmpty && shown != app.version
-        let hasDetails = canInstall || versionIsBuild || scanVersionDiffers || !saved.isEmpty
+        let hasDetails = versionIsBuild || scanVersionDiffers || !saved.isEmpty
         let open = hasDetails && expandedApplications.contains(app.key)
         let header = HStack(spacing: 14) {
             Image(nsImage: applicationIcon(app.identifier))
@@ -5683,16 +6594,6 @@ struct ReportView: View {
                     if scanVersionDiffers {
                         Text("Scan recorded \(app.version)").font(.caption).foregroundStyle(.secondary)
                     }
-                    if canInstall, let reported = record?.reported {
-                        Button("Update") {
-                            installLog = ""
-                            installMessage = ""
-                            let kind: AppInstallKind = if case .vscode = appChannel(app) { .developerZip } else { .sparkle }
-                            appInstall = AppInstallRequest(bundleID: app.identifier, name: app.name, fromVersion: shown, toVersion: reported, kind: kind)
-                        }
-                        .wardGlassButton(prominent: true)
-                        .disabled(installing || checkingUpdates)
-                    }
                     ForEach(Array((affected + review).enumerated()), id: \.offset) { _, item in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(item.status == "review" ? "Needs review" : "Finding")
@@ -5707,6 +6608,25 @@ struct ReportView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(16)
+            }
+            if canInstall, let reported = record?.reported {
+                Divider().padding(.horizontal, 16)
+                HStack {
+                    Label("Update through Ward", systemImage: "checkmark.shield")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Update") {
+                        updateAllResults = [:]
+                        installLog = ""
+                        installMessage = ""
+                        appInstall = AppInstallRequest(bundleID: app.identifier, name: app.name,
+                                                       fromVersion: shown, toVersion: reported,
+                                                       kind: applicationInstallKind(app))
+                    }
+                    .wardGlassButton(prominent: true)
+                    .disabled(installing || checkingUpdates || model.busy)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 12)
             }
         }
         .wardGlass(radius: 18)
@@ -5745,40 +6665,118 @@ struct ReportView: View {
         Task { await model.checkApplicationVersions(apps, showProgress: showProgress) }
     }
 
-    private func runAppUpdate(_ request: AppInstallRequest) {
+    private func updateButtonTitle(_ bundleID: String) -> String {
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).contains { !$0.isTerminated }
+        return running ? "Quit, Update & Reopen" : "Update"
+    }
+
+    private var applicationInstallProgress: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(installing ? (installStage.isEmpty ? "Preparing update…" : installStage)
+                 : (updateAllResults.isEmpty ? "Ready to update" : "Updates finished"))
+                .font(.callout.weight(.semibold)).lineLimit(1)
+                .frame(maxWidth: .infinity, minHeight: 16, maxHeight: 16, alignment: .leading)
+                .help(installStage)
+            ZStack {
+                ProgressView(value: installing ? (installTotal > 0 ? Double(min(installBytes, installTotal)) / Double(installTotal) : 0) : (updateAllResults.isEmpty ? 0 : 1))
+                    .opacity(installing && installTotal <= 0 ? 0 : 1)
+                if installing && installTotal <= 0 {
+                    ProgressView().progressViewStyle(.linear)
+                }
+            }.frame(height: 8)
+            Text(installing && installTotal > 0
+                 ? "\(ByteCountFormatter.string(fromByteCount: installBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: installTotal, countStyle: .file))"
+                 : " ")
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(height: 12)
+        }.frame(height: 44)
+    }
+
+    private func installationDownloadProgress(_ received: Int64, _ total: Int64) {
+        guard installStage.hasPrefix("Downloading") else { return }
+        installStage = "Downloading update…"
+        installBytes = received
+        installTotal = total
+    }
+
+    private func presentAllAppUpdates() {
+        let requests = availableInstallRequests
+        guard !requests.isEmpty else { return }
+        updateAllResults = [:]
+        installLog = ""
+        appUpdateBatch = AppUpdateBatch(requests: requests)
+    }
+
+    private func applicationInstallKind(_ app: Report.Inventory.Application) -> AppInstallKind {
+        switch appChannel(app) {
+        case .vscode: return .developerZip
+        case .jetBrains, .electron: return .vendorArchive
+        default: return .sparkle
+        }
+    }
+
+    private var availableInstallRequests: [AppInstallRequest] {
+        listedApplications.compactMap { app in
+            guard let record = updateChecks[app.identifier], record.newer, record.canInstall,
+                  app.identifier != Bundle.main.bundleIdentifier,
+                  let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier),
+                  canReplaceInstalledApp(installed) || supportsAdminReplacement(installed) else { return nil }
+            return AppInstallRequest(bundleID: app.identifier, name: app.name,
+                                     fromVersion: liveVersion(app), toVersion: record.reported,
+                                     kind: applicationInstallKind(app))
+        }
+    }
+
+    private func performAppUpdate(_ request: AppInstallRequest) async throws {
+        installStage = "Preparing " + request.name + "…"
+        installBytes = 0
+        installTotal = 0
+        let reopenURL: URL?
+        switch request.kind {
+        case .sparkle: reopenURL = try await installSparkleUpdate(request)
+        case .developerZip: reopenURL = try await installDeveloperZip(request)
+        case .vendorArchive: reopenURL = try await installVendorArchive(request)
+        }
+        var record = updateChecks[request.bundleID] ?? AppUpdateRecord(
+            text: "", newer: false, canInstall: false, reported: request.toVersion, installed: request.toVersion)
+        record.text = "Updated to \(request.toVersion)."
+        record.newer = false
+        record.canInstall = false
+        record.reported = request.toVersion
+        record.installed = request.toVersion
+        updateChecks[request.bundleID] = record
+        AppUpdateStore.save(updateChecks)
+        model.updateAppBadge(updateChecks, for: Set(listedApplications.map(\.identifier)))
+        installMessage = "Updated to \(request.toVersion)."
+        installStage = "Update installed"
+        installTotal = 0
+        if let reopenURL {
+            do {
+                installStage = "Reopening " + request.name + "…"
+                _ = try await NSWorkspace.shared.openApplication(at: reopenURL, configuration: .init())
+                installMessage += " Reopened \(request.name)."
+            } catch {
+                installMessage += " Could not reopen \(request.name): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func runAllAppUpdates(_ requests: [AppInstallRequest]) {
         guard !installing, !checkingUpdates, !model.busy else { return }
         model.installingApplication = true
-        installMessage = ""
-        installLog = ""
+        stopUpdateAll = false
         Task {
             defer { model.installingApplication = false }
-            do {
-                let reopenURL: URL?
-                switch request.kind {
-                case .sparkle: reopenURL = try await installSparkleUpdate(request)
-                case .developerZip: reopenURL = try await installDeveloperZip(request)
+            for request in requests {
+                if stopUpdateAll { break }
+                guard updateAllResults[request.bundleID] == nil else { continue }
+                updateAllResults[request.bundleID] = "Downloading and verifying…"
+                installLog = ""
+                do {
+                    try await performAppUpdate(request)
+                    updateAllResults[request.bundleID] = installMessage
+                } catch {
+                    updateAllResults[request.bundleID] = error.localizedDescription
                 }
-                var record = updateChecks[request.bundleID] ?? AppUpdateRecord(
-                    text: "", newer: false, canInstall: false, reported: request.toVersion, installed: request.toVersion)
-                record.text = "Updated to \(request.toVersion)."
-                record.newer = false
-                record.canInstall = false
-                record.reported = request.toVersion
-                record.installed = request.toVersion
-                updateChecks[request.bundleID] = record
-                AppUpdateStore.save(updateChecks)
-                model.updateAppBadge(updateChecks, for: Set(listedApplications.map(\.identifier)))
-                installMessage = "Updated to \(request.toVersion)."
-                if let reopenURL {
-                    do {
-                        _ = try await NSWorkspace.shared.openApplication(at: reopenURL, configuration: .init())
-                        installMessage += " Reopened \(request.name)."
-                    } catch {
-                        installMessage += " Could not reopen \(request.name): \(error.localizedDescription)"
-                    }
-                }
-            } catch {
-                installMessage = error.localizedDescription
             }
         }
     }
@@ -5844,6 +6842,8 @@ struct ReportView: View {
 
     private func installSparkleUpdate(_ request: AppInstallRequest) async throws -> URL? {
         func log(_ line: String) {
+            installStage = line
+            installTotal = 0
             installLog = String((installLog + line + "\n").suffix(8_000))
         }
         guard request.bundleID != "com.shixpeer.ward" else { throw WardError("Ward does not replace itself.") }
@@ -5871,29 +6871,35 @@ struct ReportView: View {
             throw WardError("The feed has no signed archive for \(newest).")
         }
         log("Downloading \(archive.url.lastPathComponent).")
-        let zip = try await downloadHTTPS(archive.url, maxBytes: archive.length ?? AppUpdateStore.maxBytes)
+        let zip = try await downloadHTTPS(archive.url, maxBytes: archive.length ?? AppUpdateStore.maxBytes, progress: { received, total in installationDownloadProgress(received, total) })
         defer { try? FileManager.default.removeItem(at: zip) }
         if let expected = archive.length {
             let size = (try FileManager.default.attributesOfItem(atPath: zip.path)[.size] as? NSNumber)?.intValue ?? 0
             guard size == expected else { throw WardError("The download size does not match the feed.") }
         }
         log("Checking the Ed25519 signature.")
-        let bytes = try Data(contentsOf: zip)
-        let key = try Curve25519.Signing.PublicKey(rawRepresentation: publicKey)
-        guard key.isValidSignature(archive.signature, for: bytes) else {
-            throw WardError("The update signature does not match the key shipped in the app.")
-        }
+        try await Task.detached {
+            let bytes = try Data(contentsOf: zip, options: [.mappedIfSafe])
+            let key = try Curve25519.Signing.PublicKey(rawRepresentation: publicKey)
+            guard key.isValidSignature(archive.signature, for: bytes) else {
+                throw WardError("The update signature does not match the key shipped in the app.")
+            }
+        }.value
         log("Unpacking the archive.")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("shixpeer-ward-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        try unpackArchive(zip, to: root, maxUnpacked: 400_000_000)
-        let unpacked = try sparkleApp(in: root, bundleID: request.bundleID, version: newest)
+        defer { Task.detached { try? FileManager.default.removeItem(at: root) } }
+        let unpacked = try await Task.detached {
+            try unpackArchive(zip, to: root, maxUnpacked: AppUpdateStore.maxExpandedArchive)
+            return try sparkleApp(in: root, bundleID: request.bundleID, version: newest)
+        }.value
         return try await replaceUpdatedApp(request, installed: installed, unpacked: unpacked, log: log)
     }
 
     private func installDeveloperZip(_ request: AppInstallRequest) async throws -> URL? {
         func log(_ line: String) {
+            installStage = line
+            installTotal = 0
             installLog = String((installLog + line + "\n").suffix(8_000))
         }
         guard request.bundleID != "com.shixpeer.ward" else { throw WardError("Ward does not replace itself.") }
@@ -5916,19 +6922,69 @@ struct ReportView: View {
             throw WardError("The updater changed. Check versions again before updating.")
         }
         log("Downloading \(archive.lastPathComponent).")
-        let zip = try await downloadHTTPS(archive, maxBytes: AppUpdateStore.maxDeveloperZip)
+        let zip = try await downloadHTTPS(archive, maxBytes: AppUpdateStore.maxDeveloperZip, progress: { received, total in installationDownloadProgress(received, total) })
         defer { try? FileManager.default.removeItem(at: zip) }
         log("Unpacking the archive.")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("shixpeer-ward-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        try unpackArchive(zip, to: root, maxUnpacked: 2_000_000_000)
-        let unpacked = try sparkleApp(in: root, bundleID: request.bundleID, version: request.toVersion)
-        log("Checking the developer signature.")
-        try runTool("/usr/bin/codesign", ["--verify", "--strict", unpacked.path])
-        guard let currentTeam = signingTeam(installed), let newTeam = signingTeam(unpacked), currentTeam == newTeam else {
-            throw WardError("The new copy is not signed by the same developer as the installed app.")
+        defer { Task.detached { try? FileManager.default.removeItem(at: root) } }
+        let unpacked = try await Task.detached {
+            try unpackArchive(zip, to: root, maxUnpacked: 2_000_000_000)
+            let app = try sparkleApp(in: root, bundleID: request.bundleID, version: request.toVersion)
+            guard let team = signingTeam(installed) else { throw WardError("The installed developer signature is unavailable.") }
+            try verifyDeveloperUpdate(app, bundleID: request.bundleID, team: team)
+            return app
+        }.value
+        return try await replaceUpdatedApp(request, installed: installed, unpacked: unpacked, log: log)
+    }
+
+    private func installVendorArchive(_ request: AppInstallRequest) async throws -> URL? {
+        guard request.bundleID != Bundle.main.bundleIdentifier else {
+            throw WardError("Ward cannot replace its running application.")
         }
+        guard let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID),
+              let plist = NSDictionary(contentsOf: installed.appendingPathComponent("Contents/Info.plist")),
+              plist["CFBundleShortVersionString"] as? String == request.fromVersion,
+              let team = signingTeam(installed) else {
+            throw WardError("The installed version or developer signature changed. Check updates again.")
+        }
+        let package: VendorPackage
+        if let channel = jetBrainsChannel(installed, identifier: request.bundleID),
+           case .jetBrains(let code, _) = channel {
+            package = try await jetBrainsPackage(code)
+        } else if let feed = electronFeed(installed) {
+            package = try await electronPackage(feed)
+        } else {
+            throw WardError("The application no longer declares a supported package feed.")
+        }
+        guard package.version == request.toVersion, let url = package.url else {
+            throw WardError("The package feed changed. Check updates again.")
+        }
+        func log(_ text: String) {
+            installStage = text
+            installTotal = 0
+            installLog = String((installLog + text + "\n").suffix(8_000))
+        }
+        log("Downloading " + url.lastPathComponent)
+        let file = try await downloadHTTPS(url, maxBytes: package.size ?? AppUpdateStore.maxVendorArchive, progress: { received, total in installationDownloadProgress(received, total) })
+        defer { try? FileManager.default.removeItem(at: file) }
+        if let size = package.size {
+            guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize) == size else {
+                throw WardError("The archive size differs from its feed.")
+            }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("shixpeer-ward-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { Task.detached { try? FileManager.default.removeItem(at: root) } }
+        log("Unpacking the application…")
+        let unpacked = try await Task.detached {
+            try unpackArchive(file, to: root, maxUnpacked: AppUpdateStore.maxExpandedArchive)
+            return try sparkleApp(in: root, bundleID: request.bundleID, version: request.toVersion)
+        }.value
+        log("Verifying the developer signature…")
+        try await Task.detached {
+            try verifyDeveloperUpdate(unpacked, bundleID: request.bundleID, team: team)
+        }.value
         return try await replaceUpdatedApp(request, installed: installed, unpacked: unpacked, log: log)
     }
 
@@ -5936,6 +6992,15 @@ struct ReportView: View {
                                    log: (String) -> Void) async throws -> URL? {
         guard canReplaceInstalledApp(installed) || supportsAdminReplacement(installed) else {
             throw WardError("Ward cannot replace this copy. Open \(request.name) to update it there.")
+        }
+        guard let plist = NSDictionary(contentsOf: installed.appendingPathComponent("Contents/Info.plist")),
+              (plist["CFBundleShortVersionString"] as? String) == request.fromVersion else {
+            throw WardError("The installed version changed. Check updates again.")
+        }
+        if let team = signingTeam(installed) {
+            try await Task.detached {
+                try verifyDeveloperUpdate(unpacked, bundleID: request.bundleID, team: team)
+            }.value
         }
         let needsAdmin = !canReplaceInstalledApp(installed)
         let requirement: String?
@@ -5946,7 +7011,9 @@ struct ReportView: View {
                 throw WardError("Administrator installation requires the same developer signature on both copies.")
             }
             let verifiedRequirement = "anchor apple generic and identifier \"\(request.bundleID)\" and certificate leaf[subject.OU] = \"\(team)\""
-            try runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", "-R=" + verifiedRequirement, unpacked.path])
+            try await Task.detached {
+                try runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", "-R=" + verifiedRequirement, unpacked.path])
+            }.value
             requirement = verifiedRequirement
         } else {
             requirement = nil
@@ -5984,8 +7051,10 @@ struct ReportView: View {
                                              version: request.toVersion)
             replacement = installed
         } else {
-            replacement = try FileManager.default.replaceItemAt(installed, withItemAt: unpacked,
-                                                                backupItemName: nil, options: .usingNewMetadataOnly)
+            replacement = try await Task.detached {
+                try FileManager.default.replaceItemAt(installed, withItemAt: unpacked,
+                                                      backupItemName: nil, options: .usingNewMetadataOnly)
+            }.value
         }
         log("Installed \(request.toVersion).")
         return running.isEmpty ? nil : (replacement ?? installed)
