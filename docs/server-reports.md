@@ -181,3 +181,12 @@ existing TLS certificate add `--tls-cert /path/fullchain.pem --tls-key
 /path/privkey.pem`; `--listen 127.0.0.1` restricts binding to loopback. It does not
 install Go/OpenSSL or alter network/firewall rules. The legacy positional syntax
 remains supported.
+
+Relay host fields accept DNS names, IPv4 and IPv6. The command preview follows
+host/port edits immediately; Copy command confirms a successful clipboard write.
+IPv6 HTTPS origins use brackets. Generated certificates use IP SAN and IP
+verification for literal addresses, retaining normal DNS SAN/hostname verification
+for DNS names. `python3 packaging/test-relay-options.py` covers argument parsing
+and address/TLS selection without starting a service or changing the host.
+
+Relay setup shows four short stages and ends with `SUCCESS` only after authenticated HTTPS verification, or `FAILED` with a reason. Detailed setup output is saved privately in `~/.shixpeer.ward/logs/relay-setup.log`. The existing-checkout command first pulls the latest repository version.

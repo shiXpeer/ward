@@ -2904,6 +2904,7 @@ private struct ServerSetupWizard: View {
     @State private var relayGuideExistingCheckout = false
     @State private var relayGuideCertificate = ""
     @State private var relayGuidePrivateKey = ""
+    @State private var setupContentHeight: CGFloat = 360
     @State private var relayAddress = ""
     @State private var relayReadToken = ""
     @State private var relayConnected = false
@@ -2931,10 +2932,11 @@ private struct ServerSetupWizard: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Connect a Server · Step \(step + 1) of \(titles.count)").foregroundStyle(.secondary)
-                Text(titles[step]).font(.title.weight(.semibold))
+                Text(titles[step]).font(.title2.weight(.semibold))
             }
             .padding(18)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 88)
             .wardBanner(tint: .pink)
 
             ScrollView {
@@ -2950,6 +2952,13 @@ private struct ServerSetupWizard: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.bottom, 8)
+                .background(GeometryReader { proxy in
+                    Color.clear.onAppear { if proxy.size.height > 10 { setupContentHeight = proxy.size.height } }
+                        .onChange(of: proxy.size.height) { _, height in
+                            if height > 10 && abs(setupContentHeight - height) > 1 { setupContentHeight = height }
+                        }
+                })
             }
             HStack {
                 Button("Close") { dismiss() }.wardGlassButton().keyboardShortcut(.cancelAction)
@@ -2967,10 +2976,11 @@ private struct ServerSetupWizard: View {
                 } else if let verified {
                     Button("Open Report") { openReport(verified.0.id) }.wardGlassButton(prominent: true)
                 }
-            }
+            }.frame(height: 32)
         }
+        .font(.system(size: 14))
         .padding(24)
-        .frame(width: 680, height: 530)
+        .frame(width: 700, height: min(max(480, setupContentHeight + 208), max(480, (NSScreen.main?.visibleFrame.height ?? 900) - 100)))
         .sheet(isPresented: $showingRelayGuide) { relayGuide }
         .interactiveDismissDisabled(checking)
         .onAppear {
@@ -3006,17 +3016,15 @@ private struct ServerSetupWizard: View {
             }
             if let source, !sourceReady {
                 VStack(alignment: .leading, spacing: 10) {
-                    Label("Server setup is blocked", systemImage: "exclamationmark.triangle.fill")
+                    Label("Connect a relay to continue", systemImage: "exclamationmark.triangle.fill")
                         .font(.headline)
                         .foregroundStyle(.orange)
                     if source.relay.isEmpty {
-                        Text("Enter the HTTPS address and reader token of a running report relay. If you manage the server, open the setup instructions below.")
-                            .foregroundStyle(.secondary)
-                        Button("How do I set up a relay?", systemImage: "questionmark.circle") {
+                        Button("Setup instructions & command", systemImage: "terminal") {
                             showingRelayGuide = true
                         }
                         .wardGlassButton()
-                        TextField("Relay URL, e.g. https://relay.example:8444", text: $relayAddress)
+                        TextField("Relay URL · https://relay.example.com:8444", text: $relayAddress)
                             .textFieldStyle(.roundedBorder)
                         SecureField("Relay reader token", text: $relayReadToken)
                             .textFieldStyle(.roundedBorder)
@@ -3028,7 +3036,7 @@ private struct ServerSetupWizard: View {
                                   relayReadToken.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count < 32)
                     }
                     if source.feedKey.isEmpty {
-                        Text("This Beacon also needs a trusted feed.pub key. Configure the key in Beacons.")
+                        Text("Add this Beacon’s trusted feed.pub in Beacons.")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -3042,8 +3050,6 @@ private struct ServerSetupWizard: View {
             }
             TextField("Server ID, e.g. prod-web-01", text: $serverID).textFieldStyle(.roundedBorder)
                 .onChange(of: serverID) { _, _ in installationCommand = nil; commandExpiry = nil; verified = nil }
-            Text("A unique ID for this server. Ward registers it with the relay automatically.")
-                .foregroundStyle(.secondary)
             Picker("Scan interval", selection: $interval) {
                 ForEach(["15m", "1h", "6h", "24h"], id: \.self) { Text($0).tag($0) }
             }.onChange(of: interval) { _, _ in installationCommand = nil; commandExpiry = nil; verified = nil }
@@ -3051,61 +3057,11 @@ private struct ServerSetupWizard: View {
     }
 
     private var relayGuide: some View {
-        let command = ServerEnrollmentCommand.relaySetupCommand(hostname: relayGuideHostname,
-            port: relayGuidePort, existingCheckout: relayGuideExistingCheckout,
-            certificate: relayGuideCertificate, privateKey: relayGuidePrivateKey)
-        return VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Set Up a Report Relay").font(.title2.bold())
-                Text("Receives encrypted server reports.").foregroundStyle(.secondary)
-            }.padding(18).frame(maxWidth: .infinity, alignment: .leading).wardBanner(tint: .pink)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack {
-                        TextField("Relay hostname (relay.example.com)", text: $relayGuideHostname).textFieldStyle(.roundedBorder)
-                        TextField("Port", text: $relayGuidePort).textFieldStyle(.roundedBorder).frame(width: 90)
-                    }
-                    Text("Use the DNS name your Mac and servers can reach.").font(.caption).foregroundStyle(.secondary)
-                    Toggle("Repository already cloned", isOn: $relayGuideExistingCheckout)
-                    DisclosureGroup("Use my TLS certificate (optional)") {
-                        VStack(spacing: 8) {
-                            TextField("Certificate path on the server", text: $relayGuideCertificate).textFieldStyle(.roundedBorder)
-                            TextField("Private key path on the server", text: $relayGuidePrivateKey).textFieldStyle(.roundedBorder)
-                        }.padding(.top, 8)
-                    }.font(.callout)
-                    if let command {
-                        Text(relayGuideExistingCheckout ? "Run in the repository folder on the relay host." : "Paste into the relay host terminal.")
-                            .font(.callout)
-                        snippet(command)
-                    } else {
-                        Text("Enter a hostname and port (1024–65535). TLS paths must be supplied together.")
-                            .font(.callout).foregroundStyle(.secondary)
-                    }
-                    Label("Builds · sets up TLS and tokens · enables startup · checks HTTPS", systemImage: "checkmark.shield")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text("Requires Linux + systemd, Go 1.26.10+ and OpenSSL. sudo may be requested for startup.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Divider()
-                    Text("Then copy the printed URL and tokens into Ward.").font(.callout.weight(.medium))
-                    Text("For generated TLS, trust the public certificate on your Mac and select it when connecting an agent.")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text("Agent installation also needs a current signed agent release on Beacon.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }
-            HStack {
-                Spacer()
-                Button("Done") { showingRelayGuide = false }
-                    .wardGlassButton(prominent: true).keyboardShortcut(.cancelAction)
-            }
-        }.padding(24).frame(width: 680, height: 580)
-            .onAppear {
-                if relayGuideHostname.isEmpty,
-                   let address = URLComponents(string: source?.relay.isEmpty == false ? source!.relay : relayAddress),
-                   let host = address.host {
-                    relayGuideHostname = host
-                    relayGuidePort = String(address.port ?? 8444)
-                }
+        RelaySetupGuide(relayGuideHostname: $relayGuideHostname, relayGuidePort: $relayGuidePort,
+            relayGuideExistingCheckout: $relayGuideExistingCheckout, relayGuideCertificate: $relayGuideCertificate,
+            relayGuidePrivateKey: $relayGuidePrivateKey, initialAddress: source?.relay.isEmpty == false ? source!.relay : relayAddress) { origin in
+                if let origin, source?.relay.isEmpty == true { relayAddress = origin }
+                showingRelayGuide = false
             }
     }
 
@@ -3220,14 +3176,14 @@ private struct ServerSetupWizard: View {
         }
     }
 
-    private func snippet(_ text: String) -> some View {
+    private func snippet(_ text: String, copyEnabled: Bool = true) -> some View {
         VStack(alignment: .trailing, spacing: 6) {
             Button("Copy", systemImage: "doc.on.doc") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(text, forType: .string)
             }
-            .wardGlassButton()
-            Text(text).font(.callout.monospaced()).textSelection(.enabled)
+            .wardGlassButton().disabled(!copyEnabled)
+            Text(text).font(.system(size: 14, design: .monospaced)).textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12).wardGlass(radius: 12)
@@ -3242,6 +3198,96 @@ private struct ServerSetupWizard: View {
             do { try data.write(to: url, options: .atomic) }
             catch { self.error = error.localizedDescription }
         }
+    }
+}
+
+private struct RelaySetupGuide: View {
+    @Binding var relayGuideHostname: String
+    @Binding var relayGuidePort: String
+    @Binding var relayGuideExistingCheckout: Bool
+    @Binding var relayGuideCertificate: String
+    @Binding var relayGuidePrivateKey: String
+    let initialAddress: String
+    let done: (String?) -> Void
+    @State private var relayContentHeight: CGFloat = 380
+    @State private var relayOptionsOpen = false
+    @State private var copied = false
+    @State private var copyFailed = false
+
+    var body: some View {
+        let command = ServerEnrollmentCommand.relaySetupCommand(hostname: relayGuideHostname,
+            port: relayGuidePort, existingCheckout: relayGuideExistingCheckout,
+            certificate: relayGuideCertificate, privateKey: relayGuidePrivateKey)
+        let preview = command ?? ServerEnrollmentCommand.relaySetupPreview(hostname: relayGuideHostname,
+            port: relayGuidePort, existingCheckout: relayGuideExistingCheckout,
+            certificate: relayGuideCertificate, privateKey: relayGuidePrivateKey)
+        return VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Set Up a Report Relay").font(.title2.bold())
+                Text("Receives encrypted reports from your servers.").foregroundStyle(.secondary)
+            }.padding(18).frame(maxWidth: .infinity, alignment: .leading).frame(height: 88).wardBanner(tint: .pink)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("1. Open SSH on the relay server. Enter its IP or hostname and run the command below.")
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        TextField("IP or hostname · relay.example.com", text: $relayGuideHostname).textFieldStyle(.roundedBorder)
+                        TextField("Port", text: $relayGuidePort).textFieldStyle(.roundedBorder).frame(width: 90)
+                    }
+                    VStack(alignment: .trailing, spacing: 8) {
+                        Button(copied ? "Copied" : "Copy command", systemImage: copied ? "checkmark" : "doc.on.doc") {
+                            guard let command else { return }
+                            NSPasteboard.general.clearContents()
+                            copied = NSPasteboard.general.setString(command, forType: .string)
+                            copyFailed = !copied
+                        }.wardGlassButton(prominent: true).disabled(command == nil)
+                        Text(preview).font(.system(size: 14, design: .monospaced)).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.padding(12).wardGlass(radius: 12)
+                    if copyFailed { Text("Could not copy. Try again.").foregroundStyle(.orange) }
+                    if command == nil, !relayGuideHostname.isEmpty {
+                        Text("Enter a valid IP or hostname, port 1024–65535, and both TLS paths if using your own certificate.")
+                            .foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text("The script builds the relay, creates TLS and tokens, enables startup and checks the connection.")
+                        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    DisclosureGroup("Options", isExpanded: $relayOptionsOpen) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Toggle("Repository already cloned — run from its folder", isOn: $relayGuideExistingCheckout)
+                            Text("Own TLS certificate (leave empty to generate one)")
+                            TextField("Certificate path on server", text: $relayGuideCertificate).textFieldStyle(.roundedBorder)
+                            TextField("Private key path on server", text: $relayGuidePrivateKey).textFieldStyle(.roundedBorder)
+                            Text("Requires Linux, systemd, Go 1.26.10+ and OpenSSL.").foregroundStyle(.secondary)
+                        }.padding(.top, 10)
+                    }
+                    Text("2. Return to Ward. Paste the printed Relay URL and Reader token. Keep the Enrollment token for agent installation.")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Generated TLS: copy the public .crt to your Mac and trust it in Keychain.")
+                        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 8)
+                    .background(GeometryReader { proxy in
+                        Color.clear.onAppear { if proxy.size.height > 10 { relayContentHeight = proxy.size.height } }
+                            .onChange(of: proxy.size.height) { _, height in
+                                if height > 10 && abs(relayContentHeight - height) > 1 { relayContentHeight = height }
+                            }
+                    })
+            }
+            HStack {
+                Spacer()
+                Button("Done") {
+                    done(command == nil ? nil : ServerEnrollmentCommand.relayOrigin(hostname: relayGuideHostname, port: relayGuidePort))
+                }.wardGlassButton(prominent: true).keyboardShortcut(.cancelAction)
+            }.frame(height: 32)
+        }.font(.system(size: 14)).padding(24)
+            .frame(width: 700, height: min(max(420, relayContentHeight + 208), max(420, (NSScreen.main?.visibleFrame.height ?? 900) - 100)))
+            .onChange(of: command) { _, _ in copied = false; copyFailed = false }
+            .onAppear {
+                if relayGuideHostname.isEmpty,
+                   let address = URLComponents(string: initialAddress), let host = address.host {
+                    relayGuideHostname = host
+                    relayGuidePort = String(address.port ?? 8444)
+                }
+            }
     }
 }
 

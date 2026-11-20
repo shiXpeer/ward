@@ -110,11 +110,20 @@ import CryptoKit
                 recipient: Data(repeating: 1, count: 32).base64EncodedString(), grant: grant)
         }
         let setup = ServerEnrollmentCommand.relaySetupCommand(hostname: "relay.example.com", port: "8444", existingCheckout: false)!
-        precondition(setup.contains("git clone https://github.com/shiXpeer/ward.git shixpeer.ward && cd shixpeer.ward && bash"))
+        precondition(setup.contains("git clone --quiet https://github.com/shiXpeer/ward.git shixpeer.ward && cd shixpeer.ward && bash"))
         precondition(ServerEnrollmentCommand.relaySetupCommand(hostname: "bad;touch", port: "8444", existingCheckout: true) == nil)
         precondition(ServerEnrollmentCommand.relaySetupCommand(hostname: "relay.example.com", port: "80", existingCheckout: true) == nil)
         precondition(ServerEnrollmentCommand.relaySetupCommand(hostname: "relay.example.com", port: "8444", existingCheckout: true,
             certificate: "/tmp/cert", privateKey: "") == nil)
+        let ipCommand = ServerEnrollmentCommand.relaySetupCommand(hostname: "192.0.2.10", port: "8444", existingCheckout: true)!
+        precondition(ipCommand.contains("--hostname '192.0.2.10' --port 8444"))
+        let changed = ServerEnrollmentCommand.relaySetupCommand(hostname: "192.0.2.20", port: "9443", existingCheckout: true)!
+        precondition(changed.contains("--hostname '192.0.2.20' --port 9443") && !changed.contains("8444"))
+        precondition(ServerEnrollmentCommand.relayOrigin(hostname: "[2001:db8::1]", port: "9443") == "https://[2001:db8::1]:9443")
+        precondition(ServerEnrollmentCommand.relaySetupCommand(hostname: "2001:db8::1", port: "9443", existingCheckout: true) != nil)
+        precondition(ServerEnrollmentCommand.relayHost("999.2.3.4") == nil)
+        precondition(ServerEnrollmentCommand.relayHost("2001:db8:::1") == nil)
+        precondition(ServerEnrollmentCommand.relayHost("relay.example.com ") == "relay.example.com")
         let custom = ServerEnrollmentCommand.relaySetupCommand(hostname: "relay.example.com", port: "8444", existingCheckout: true,
             certificate: "/tmp/it's a cert.pem", privateKey: "/tmp/key.pem")!
         precondition(!custom.contains("git clone"))

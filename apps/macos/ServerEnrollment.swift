@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 struct ServerEnrollmentCommand {
     struct Grant: Decodable {
@@ -11,20 +12,46 @@ struct ServerEnrollmentCommand {
         }
     }
     static func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+    static func relayHost(_ input: String) -> String? {
+        var host = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.hasPrefix("["), host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
+        var address4 = in_addr()
+        var address6 = in6_addr()
+        let ipv4 = host.withCString { inet_pton(AF_INET, $0, &address4) == 1 }
+        let ipv6 = host.withCString { inet_pton(AF_INET6, $0, &address6) == 1 }
+        if ipv4 || ipv6 { return host }
+        guard host.count <= 253, !host.isEmpty,
+              host.range(of: "^[0-9.]+$", options: .regularExpression) == nil,
+              host.split(separator: ".", omittingEmptySubsequences: false).allSatisfy({ label in
+                  label.count <= 63 && label.range(of: "^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$", options: .regularExpression) != nil
+              }) else { return nil }
+        return host
+    }
+    static func relayOrigin(hostname: String, port: String) -> String? {
+        guard let host = relayHost(hostname), let number = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (1024...65535).contains(number) else { return nil }
+        return "https://" + (host.contains(":") ? "[" + host + "]" : host) + ":" + String(number)
+    }
+    static func relaySetupPreview(hostname: String, port: String, existingCheckout: Bool,
+                                  certificate: String = "", privateKey: String = "") -> String {
+        let host = hostname.isEmpty ? "relay.example.com" : hostname
+        let value = port.isEmpty ? "8444" : port
+        var command = "bash packaging/shixpeer-ward-prepare-relay.sh --hostname " + quote(host) + " --port " + (Int(value).map(String.init) ?? quote(value))
+        if !certificate.isEmpty { command += " --tls-cert " + quote(certificate) }
+        if !privateKey.isEmpty { command += " --tls-key " + quote(privateKey) }
+        return existingCheckout ? "git pull --ff-only --quiet && " + command : "git clone --quiet https://github.com/shiXpeer/ward.git shixpeer.ward && cd shixpeer.ward && " + command
+    }
     static func relaySetupCommand(hostname: String, port: String, existingCheckout: Bool,
                                   certificate: String = "", privateKey: String = "") -> String? {
-        guard hostname.range(of: "^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$", options: .regularExpression) != nil,
-              !hostname.contains(".."), hostname.range(of: "^[0-9.]+$", options: .regularExpression) == nil,
-              let number = Int(port), (1024...65535).contains(number),
-              certificate.isEmpty == privateKey.isEmpty else { return nil }
-        var command = "bash packaging/shixpeer-ward-prepare-relay.sh --hostname " + quote(hostname) + " --port " + String(number)
+        guard let host = relayHost(hostname), let number = Int(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (1024...65535).contains(number), certificate.isEmpty == privateKey.isEmpty else { return nil }
         if !certificate.isEmpty {
             guard certificate.hasPrefix("/"), privateKey.hasPrefix("/"),
                   !certificate.contains("\n"), !privateKey.contains("\n"),
                   !certificate.contains("\r"), !privateKey.contains("\r") else { return nil }
-            command += " --tls-cert " + quote(certificate) + " --tls-key " + quote(privateKey)
         }
-        return existingCheckout ? command : "git clone https://github.com/shiXpeer/ward.git shixpeer.ward && cd shixpeer.ward && " + command
+        return relaySetupPreview(hostname: host, port: String(number), existingCheckout: existingCheckout,
+                                 certificate: certificate, privateKey: privateKey)
     }
 
     static func readPublicFile(_ path: String, maximum: Int) throws -> Data {
