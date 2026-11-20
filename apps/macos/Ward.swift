@@ -3257,7 +3257,7 @@ private struct RelaySetupGuide: View {
                             Text("Own TLS certificate (leave empty to generate one)")
                             TextField("Certificate path on server", text: $relayGuideCertificate).textFieldStyle(.roundedBorder)
                             TextField("Private key path on server", text: $relayGuidePrivateKey).textFieldStyle(.roundedBorder)
-                            Text("Requires Linux, systemd, Go 1.26.10+ and OpenSSL.").foregroundStyle(.secondary)
+                            Text("Requires Linux, systemd, OpenSSL and curl or wget. Go is prepared automatically.").foregroundStyle(.secondary)
                         }.padding(.top, 10)
                     }
                     Text("2. Return to Ward. Paste the printed Relay URL and Reader token. Keep the Enrollment token for agent installation.")

@@ -73,7 +73,7 @@ if [[ -n $cert || -n $key ]]; then
     done
 fi
 [[ $(uname -s) == Linux && -d /run/systemd/system ]] || { fail 1 'Requires a Linux server with systemd. Nothing was installed.'; }
-for tool in go openssl systemctl loginctl install; do
+for tool in openssl systemctl loginctl install; do
     command -v "$tool" >/dev/null || { fail 1 "Missing prerequisite: $tool. Install it and rerun the command."; }
 done
 umask 077
@@ -92,7 +92,9 @@ temp=$(mktemp -d "$root/.relay-setup.XXXXXXXX")
 unit_temp=$(mktemp "$unit_dir/.ward-relay.XXXXXXXX")
 trap 'rm -rf -- "$temp"; rm -f -- "$unit_temp"' EXIT
 progress 1 'Building relay'
-go build -trimpath -o "$temp/shixpeer-ward-relay" ./cmd/shixpeer-ward-relay >> "$setup_log" 2>&1
+source packaging/relay-build-toolchain.sh
+relay_prepare_go "$temp" "$setup_log"
+CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -o "$temp/shixpeer-ward-relay" ./cmd/shixpeer-ward-relay >> "$setup_log" 2>&1
 progress 2 'Configuring TLS and credentials'
 
 if [[ -z $cert ]]; then

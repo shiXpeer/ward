@@ -178,8 +178,12 @@ and verifies authenticated HTTPS. It prints URL, reader token, enrollment token
 and public certificate path only after verification succeeds. Keep this output
 private. Existing credentials and encrypted report state are preserved. For an
 existing TLS certificate add `--tls-cert /path/fullchain.pem --tls-key
-/path/privkey.pem`; `--listen 127.0.0.1` restricts binding to loopback. It does not
-install Go/OpenSSL or alter network/firewall rules. The legacy positional syntax
+/path/privkey.pem`; `--listen 127.0.0.1` restricts binding to loopback.
+When Go 1.26.10+ is missing, setup downloads an official, pinned Go archive from
+`go.dev` (redirects to `dl.google.com`), verifies its SHA-256, and uses it in a
+temporary directory that is removed on exit. This supports Linux x86_64/arm64
+and requires curl or wget. It does not install system packages or alter
+network/firewall rules. The legacy positional syntax
 remains supported.
 
 Relay host fields accept DNS names, IPv4 and IPv6. The command preview follows
