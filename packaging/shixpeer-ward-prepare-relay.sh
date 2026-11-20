@@ -190,7 +190,7 @@ fi
 progress 4 'Verifying authenticated HTTPS'
 ready=false
 for attempt in {1..12}; do
-    if "$binary" check -config "$config" -url "$origin" -ca-file "$cert" > "$temp/connection.txt" 2> "$temp/check-error.txt"; then
+    if "$binary" check -pairing -config "$config" -url "$origin" -ca-file "$cert" > "$temp/connection.txt" 2> "$temp/check-error.txt"; then
         ready=true
         break
     fi
@@ -201,5 +201,6 @@ if [[ $ready != true ]]; then
     fail 1 'HTTPS verification failed. Check the address, port, firewall and TLS certificate.'
 fi
 printf '\nSUCCESS: Relay is running. Startup after reboot is enabled.\n'
+printf 'In Ward: Servers → Connect a Server → paste this connection code:\n\n'
 cat "$temp/connection.txt"
-printf 'Public TLS certificate: %s\nPaste the URL and tokens into Ward. Keep the tokens private.\n' "$cert"
+printf '\nThis private code connects Ward to %s. Do not share it.\n' "$origin"

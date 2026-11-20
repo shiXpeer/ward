@@ -64,9 +64,13 @@ not production inventories, credentials or external services.
 ## One-command agent installation (enrollment v1)
 
 In Servers → Connect a Server choose a configured Beacon/relay, a new server ID and
-scan interval. In Install and connect enter the **separate enrollment management
-token** (saved in macOS Keychain), optionally select the relay's public TLS
-certificate/CA for private HTTPS, and create the command. Copy/paste it into the
+scan interval. Paste the `WARD-RELAY-1:` connection code printed by relay setup
+and confirm the displayed relay address. Ward verifies HTTPS using the included
+public certificate, stores access tokens in Keychain, and scopes certificate trust
+to this relay. No system trust changes or certificate transfer are needed.
+In Install and connect create the command; credentials and certificate are filled
+automatically. Legacy manual connections can still enter tokens/CA separately.
+Copy/paste the installation command into the
 Linux server terminal. It requests sudo, installs the signed Linux agent under the
 existing restricted service account, enrolls it, writes private upload settings and
 enables/restarts systemd. No manual JSON or unit override is required. The first
@@ -174,9 +178,11 @@ bash packaging/shixpeer-ward-prepare-relay.sh --hostname relay.example.com --por
 
 The script builds the relay, creates/reuses TLS and tokens, enables lingering
 (startup after logout/reboot, requesting sudo if needed), starts the user service,
-and verifies authenticated HTTPS. It prints URL, reader token, enrollment token
-and public certificate path only after verification succeeds. Keep this output
-private. Existing credentials and encrypted report state are preserved. For an
+and verifies authenticated HTTPS. Only then it prints one private connection
+code for Servers → Connect a Server. The versioned code contains the HTTPS origin,
+reader/enrollment credentials and public certificate, never the TLS private key.
+It is an encoded secret, not encryption: copy it through your authenticated server
+terminal and keep it private. Existing credentials and encrypted report state are preserved. For an
 existing TLS certificate add `--tls-cert /path/fullchain.pem --tls-key
 /path/privkey.pem`; `--listen 127.0.0.1` restricts binding to loopback.
 When Go 1.26.10+ is missing, setup downloads an official, pinned Go archive from

@@ -17,6 +17,29 @@ import CryptoKit
     static func main() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
+        let certificateData = try Data(contentsOf: URL(fileURLWithPath: ProcessInfo.processInfo.environment["WARD_TEST_RELAY_CERT"]!))
+        let anchor = SecCertificateCreateWithData(nil, certificateData as CFData)!
+        func trust() -> SecTrust {
+            var result: SecTrust?
+            precondition(SecTrustCreateWithCertificates(anchor, SecPolicyCreateSSL(true, "relay.example.test" as CFString), &result) == errSecSuccess)
+            return result!
+        }
+        precondition(NoRedirect.accepts(trust(), host: "relay.example.test", anchor: anchor))
+        precondition(!NoRedirect.accepts(trust(), host: "wrong.example.test", anchor: anchor))
+        let expired = trust()
+        SecTrustSetVerifyDate(expired, Date().addingTimeInterval(86400 * 10) as CFDate)
+        precondition(!NoRedirect.accepts(expired, host: "relay.example.test", anchor: anchor))
+        let payload: [String: Any] = ["version": 1, "origin": "https://relay.example.test:8444", "reader": String(repeating: "r", count: 32), "enrollment": String(repeating: "e", count: 32), "certificate": certificateData.base64EncodedString()]
+        func encoded(_ data: [String: Any]) throws -> String { "WARD-RELAY-1:" + (try JSONSerialization.data(withJSONObject: data)).base64EncodedString() }
+        let pairing = try RelayConnectionCode.parse(encoded(payload))
+        precondition(pairing.certificate == certificateData)
+        var invalid = payload
+        invalid["origin"] = "http://relay.example.test"
+        try await rejects { _ = try RelayConnectionCode.parse(encoded(invalid)) }
+        invalid = payload; invalid["enrollment"] = payload["reader"]
+        try await rejects { _ = try RelayConnectionCode.parse(encoded(invalid)) }
+        try await rejects { _ = try RelayConnectionCode.parse("not a code") }
+        print("PASS: relay pairing, scoped TLS trust, hostname and expiry rejection")
         let archive = ServerReportArchive(root: root)
         let beacon = UUID()
         let now = Date(timeIntervalSince1970: 1_800_000_000)

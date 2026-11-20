@@ -25,6 +25,7 @@ struct Beacon: Codable, Identifiable {
     var feedKey: String
     var caFile: String
     var relay: String
+    var relayCertificate: Data? = nil
 }
 
 struct Report: Decodable {
@@ -256,6 +257,28 @@ enum Vault {
 }
 
 final class NoRedirect: NSObject, URLSessionTaskDelegate {
+    let certificate: Data?
+    init(certificate: Data? = nil) { self.certificate = certificate }
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard let certificate else { completionHandler(.performDefaultHandling, nil); return }
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust,
+              let anchor = SecCertificateCreateWithData(nil, certificate as CFData) else {
+            completionHandler(.cancelAuthenticationChallenge, nil); return
+        }
+        if Self.accepts(trust, host: challenge.protectionSpace.host, anchor: anchor) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else { completionHandler(.cancelAuthenticationChallenge, nil) }
+    }
+    static func accepts(_ trust: SecTrust, host: String, anchor: SecCertificate) -> Bool {
+        guard SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, host as CFString)) == errSecSuccess,
+              SecTrustSetAnchorCertificates(trust, [anchor] as CFArray) == errSecSuccess,
+              SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else { return false }
+        SecTrustSetNetworkFetchAllowed(trust, false)
+        return SecTrustEvaluateWithError(trust, nil)
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
@@ -270,8 +293,8 @@ enum Wire {
               parts.path.isEmpty || parts.path == "/", let url = parts.url else { throw WardError("Enter an HTTPS origin, such as https://beacon.example:8444.") }
         return url
     }
-    static func fetch(_ url: URL, token: Data, limit: Int) async throws -> Data {
-        let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
+    static func fetch(_ url: URL, token: Data, limit: Int, certificate: Data? = nil) async throws -> Data {
+        let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(certificate: certificate), delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.setValue("Bearer " + String(decoding: token, as: UTF8.self), forHTTPHeaderField: "Authorization")
@@ -425,12 +448,12 @@ private struct WardPreferences: Codable {
                 let key = try Vault.recipient()
                 guard let token = try Vault.read(beacon.id.uuidString) else { throw WardError("Relay read token missing.") }
                 let base = origin.appendingPathComponent("v1/reports")
-                let raw = try await Wire.fetch(base, token: token, limit: 1 << 20)
+                let raw = try await Wire.fetch(base, token: token, limit: 1 << 20, certificate: beacon.relayCertificate)
                 let ids = try ServerReportArchive.relayIDs(raw)
                 receivedIDs = Set(ids)
                 for id in ids {
                     do {
-                        let envelope = try await Wire.fetch(base.appendingPathComponent(id), token: token, limit: Wire.maxReport + 61)
+                        let envelope = try await Wire.fetch(base.appendingPathComponent(id), token: token, limit: Wire.maxReport + 61, certificate: beacon.relayCertificate)
                         let data = try await Task.detached { try Wire.open(envelope, id: id, key: key) }.value
                         let previous = devices.first { $0.id == beacon.id.uuidString + ":" + id }?.report
                         let (catalog, report) = try await serverArchive.accept(data, beaconID: beacon.id, serverID: id)
@@ -628,13 +651,13 @@ private struct WardPreferences: Codable {
         try JSONEncoder().encode(all).write(to: root.appendingPathComponent("beacons.json"), options: .atomic)
         beacons = all
     }
-    func connectRelay(to beaconID: UUID, address: String, readToken: String) async throws {
+    func connectRelay(to beaconID: UUID, address: String, readToken: String, certificate: Data? = nil) async throws {
         let origin = try Wire.origin(address.trimmingCharacters(in: .whitespacesAndNewlines))
         let token = Data(readToken.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
         guard token.count >= 32 else { throw WardError("Enter the relay reader token (at least 32 bytes).") }
 
         let endpoint = origin.appendingPathComponent("v1/reports")
-        let response = try await Wire.fetch(endpoint, token: token, limit: 1 << 20)
+        let response = try await Wire.fetch(endpoint, token: token, limit: 1 << 20, certificate: certificate)
         _ = try JSONDecoder().decode([String].self, from: response)
 
         guard let index = beacons.firstIndex(where: { $0.id == beaconID }), beacons[index].relay.isEmpty else {
@@ -642,6 +665,7 @@ private struct WardPreferences: Codable {
         }
         var updated = beacons
         updated[index].relay = origin.absoluteString
+        updated[index].relayCertificate = certificate
         let config = try JSONEncoder().encode(updated)
         let account = beaconID.uuidString
         let previous = try Vault.read(account)
@@ -792,7 +816,10 @@ private struct WardPreferences: Codable {
         let relay = try Wire.origin(beacon.relay)
         let feedKey = try ServerEnrollmentCommand.readPublicFile(trustFile(beacon.feedKey, named: "feed.pub"), maximum: 4096)
         let feedCA = beacon.caFile.isEmpty ? nil : try ServerEnrollmentCommand.readPublicFile(trustFile(beacon.caFile, named: "ca.crt"), maximum: 65536)
-        let relayCA = relayCAPath.isEmpty ? nil : try ServerEnrollmentCommand.readPublicFile(relayCAPath, maximum: 65536)
+        let relayCA: Data?
+        if let certificate = beacon.relayCertificate {
+            relayCA = Data(("-----BEGIN CERTIFICATE-----\n" + certificate.base64EncodedString(options: .lineLength64Characters) + "\n-----END CERTIFICATE-----\n").utf8)
+        } else { relayCA = relayCAPath.isEmpty ? nil : try ServerEnrollmentCommand.readPublicFile(relayCAPath, maximum: 65536) }
         guard let installerURL = Bundle.main.url(forResource: "InstallAgent", withExtension: "sh") else {
             throw WardError("Bundled agent installer missing. Rebuild Ward.")
         }
@@ -803,7 +830,7 @@ private struct WardPreferences: Codable {
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["server_id": serverID, "recipient_public_key": recipient])
-        let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
+        let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(certificate: beacon.relayCertificate), delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw WardError("Invalid relay response.") }
@@ -835,7 +862,7 @@ private struct WardPreferences: Codable {
         let key = try Vault.recipient()
         guard let token = try Vault.read(beacon.id.uuidString) else { throw WardError("Relay read token missing.") }
         let url = origin.appendingPathComponent("v1/reports").appendingPathComponent(id)
-        let envelope = try await Wire.fetch(url, token: token, limit: Wire.maxReport + 61)
+        let envelope = try await Wire.fetch(url, token: token, limit: Wire.maxReport + 61, certificate: beacon.relayCertificate)
         let raw = try Wire.open(envelope, id: id, key: key)
         let report = try Wire.decode(raw)
         let date = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(report.generated_at))
@@ -2916,6 +2943,7 @@ private struct ServerSetupWizard: View {
     @State private var verified: (Device, Data)?
     @State private var interval = "1h"
     @State private var enrollmentToken = ""
+    @State private var relayConnectionCode = ""
     @State private var relayCAPath = ""
     @State private var installationCommand: String?
     @State private var commandExpiry: Date?
@@ -3024,16 +3052,39 @@ private struct ServerSetupWizard: View {
                             showingRelayGuide = true
                         }
                         .wardGlassButton()
-                        TextField("Relay URL · https://relay.example.com:8444", text: $relayAddress)
+                        SecureField("Paste relay connection code", text: $relayConnectionCode)
                             .textFieldStyle(.roundedBorder)
-                        SecureField("Relay reader token", text: $relayReadToken)
-                            .textFieldStyle(.roundedBorder)
-                        Button(checking ? "Checking…" : "Verify and Save Relay", systemImage: "checkmark.shield") {
-                            saveRelay(for: source)
+                        Text("Copy the WARD-RELAY-1 code from the server terminal. No Keychain certificate import needed.")
+                            .foregroundStyle(.secondary)
+                        if let code = try? RelayConnectionCode.parse(relayConnectionCode) {
+                            Text("Connect to " + code.origin).font(.headline)
                         }
-                        .wardGlassButton(prominent: true)
-                        .disabled(checking || relayAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                                  relayReadToken.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count < 32)
+                        Button(checking ? "Connecting…" : "Connect Relay", systemImage: "checkmark.shield") {
+                            checking = true
+                            error = ""
+                            Task {
+                                defer { checking = false }
+                                do {
+                                    let code = try RelayConnectionCode.parse(relayConnectionCode)
+                                    guard SecCertificateCreateWithData(nil, code.certificate as CFData) != nil else {
+                                        throw WardError("Invalid relay certificate.")
+                                    }
+                                    try await model.connectRelay(to: source.id, address: code.origin,
+                                        readToken: code.reader, certificate: code.certificate)
+                                    try Vault.store(Data(code.enrollment.utf8), source.id.uuidString + ".enrollment")
+                                    enrollmentToken = code.enrollment
+                                    relayConnectionCode = ""
+                                    relayConnected = true
+                                } catch { self.error = error.localizedDescription }
+                            }
+                        }.wardGlassButton(prominent: true)
+                            .disabled(checking || (try? RelayConnectionCode.parse(relayConnectionCode)) == nil)
+                        DisclosureGroup("Manual connection") {
+                            TextField("Relay URL", text: $relayAddress).textFieldStyle(.roundedBorder)
+                            SecureField("Reader token", text: $relayReadToken).textFieldStyle(.roundedBorder)
+                            Button("Verify and Save Relay") { saveRelay(for: source) }
+                                .disabled(checking || relayReadToken.utf8.count < 32)
+                        }
                     }
                     if source.feedKey.isEmpty {
                         Text("Add this Beacon’s trusted feed.pub in Beacons.")
@@ -3086,19 +3137,22 @@ private struct ServerSetupWizard: View {
                 .foregroundStyle(.secondary)
             Text("Requires Linux amd64/arm64, systemd, curl and OpenSSL. Other installed software is not updated.")
                 .font(.caption).foregroundStyle(.secondary)
+            let savedToken = (try? Vault.read(source.id.uuidString + ".enrollment")).map { String(decoding: $0, as: UTF8.self) } ?? ""
+            if savedToken.isEmpty {
             SecureField("Relay enrollment token", text: $enrollmentToken).textFieldStyle(.roundedBorder)
                 .disabled(installationCommand != nil)
             Text("Use the separate management token once; Ward keeps it in Keychain. It is never sent to the server.")
                 .font(.caption).foregroundStyle(.secondary)
+            }
             Button("Relay setup", systemImage: "questionmark.circle") { showingRelayGuide = true }.wardGlassButton()
-            HStack {
+            if source.relayCertificate == nil { HStack {
                 TextField("Relay CA certificate (optional for private TLS)", text: $relayCAPath).textFieldStyle(.roundedBorder)
                 Button("Choose…") {
                     let panel = NSOpenPanel()
                     panel.canChooseDirectories = false
                     panel.begin { result in if result == .OK { relayCAPath = panel.url?.path ?? "" } }
                 }.wardGlassButton()
-            }.disabled(installationCommand != nil)
+            }.disabled(installationCommand != nil) }
             Button(checking ? "Creating…" : (installationCommand == nil ? "Create installation command" : "Generate new command"), systemImage: "terminal") {
                 checking = true
                 error = ""
@@ -3107,14 +3161,14 @@ private struct ServerSetupWizard: View {
                     defer { checking = false }
                     do {
                         let result = try await model.createServerEnrollment(source, serverID: serverID, interval: interval,
-                            managementToken: enrollmentToken, relayCAPath: relayCAPath)
+                            managementToken: savedToken.isEmpty ? enrollmentToken : savedToken, relayCAPath: relayCAPath)
                         installationCommand = result.0
                         commandExpiry = result.1
                         started = requestedAt
                         verified = nil
                     } catch { self.error = error.localizedDescription }
                 }
-            }.wardGlassButton(prominent: true).disabled(checking || enrollmentToken.utf8.count < 32)
+            }.wardGlassButton(prominent: true).disabled(checking || (savedToken.isEmpty ? enrollmentToken : savedToken).utf8.count < 32)
             if let command = installationCommand, let expiry = commandExpiry {
                 VStack(alignment: .leading, spacing: 12) {
                     Button("Change settings") { installationCommand = nil; commandExpiry = nil; verified = nil }.wardGlassButton()
@@ -3260,9 +3314,9 @@ private struct RelaySetupGuide: View {
                             Text("Requires Linux, systemd, OpenSSL and curl or wget. Go is prepared automatically.").foregroundStyle(.secondary)
                         }.padding(.top, 10)
                     }
-                    Text("2. Return to Ward. Paste the printed Relay URL and Reader token. Keep the Enrollment token for agent installation.")
+                    Text("2. Copy the WARD-RELAY-1 code into Connect a Server → Connect Relay.")
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("Generated TLS: copy the public .crt to your Mac and trust it in Keychain.")
+                    Text("The code includes the public certificate and access settings. Keep it private; no files or separate tokens to transfer.")
                         .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 8)
                     .background(GeometryReader { proxy in

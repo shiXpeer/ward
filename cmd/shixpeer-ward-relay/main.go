@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -114,6 +116,7 @@ func checkRelay(args []string) error {
 	config := fs.String("config", paths.Config("relay"), "private relay configuration")
 	origin := fs.String("url", "", "public HTTPS relay origin")
 	ca := fs.String("ca-file", "", "public relay CA/certificate")
+	pairing := fs.Bool("pairing", false, "print one private Ward connection code")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -162,6 +165,28 @@ func checkRelay(args []string) error {
 	var ids []string
 	if len(data) > 1<<20 || json.Unmarshal(data, &ids) != nil {
 		return errors.New("invalid relay readiness response")
+	}
+	if *pairing {
+		certPEM, err := os.ReadFile(*ca)
+		if err != nil {
+			return err
+		}
+		block, _ := pem.Decode(certPEM)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return errors.New("invalid public TLS certificate")
+		}
+		payload, err := json.Marshal(struct {
+			Version     int    `json:"version"`
+			Origin      string `json:"origin"`
+			Reader      string `json:"reader"`
+			Enrollment  string `json:"enrollment"`
+			Certificate []byte `json:"certificate"`
+		}{1, *origin, cfg.Reader, cfg.Enrollment, block.Bytes})
+		if err != nil {
+			return err
+		}
+		fmt.Println("WARD-RELAY-1:" + base64.StdEncoding.EncodeToString(payload))
+		return nil
 	}
 	fmt.Println("Relay ready:", *origin)
 	fmt.Println("Reader token:", cfg.Reader)

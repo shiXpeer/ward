@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -50,6 +51,30 @@ func TestReadinessChecksTLSAndAuthBeforeCredentials(t *testing.T) {
 	output, err := captureCheck(t, args)
 	if err != nil || !strings.Contains(output, "Relay ready:") || !strings.Contains(output, cfg.Reader) || !strings.Contains(output, cfg.Enrollment) {
 		t.Fatal("readiness failed", err)
+	}
+	output, err = captureCheck(t, append(args, "-pairing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := strings.TrimPrefix(strings.TrimSpace(output), "WARD-RELAY-1:")
+	payload, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var code struct {
+		Version                    int
+		Origin, Reader, Enrollment string
+		Certificate                []byte
+	}
+	if err := json.Unmarshal(payload, &code); err != nil {
+		t.Fatal(err)
+	}
+	if code.Version != 1 || code.Origin != server.URL || code.Reader != cfg.Reader || code.Enrollment != cfg.Enrollment || string(code.Certificate) != string(server.Certificate().Raw) {
+		t.Fatal("incorrect pairing data")
+	}
+	output, err = captureCheck(t, append(args[:4:4], "-pairing"))
+	if err == nil || output != "" {
+		t.Fatal("pairing exposed without trusted TLS")
 	}
 	output, err = captureCheck(t, args[:4])
 	if err == nil || output != "" {

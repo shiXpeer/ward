@@ -110,3 +110,29 @@ struct ServerEnrollmentCommand {
         return command
     }
 }
+
+struct RelayConnectionCode: Decodable {
+    let version: Int
+    let origin: String
+    let reader: String
+    let enrollment: String
+    let certificate: Data
+    static func parse(_ input: String) throws -> RelayConnectionCode {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "WARD-RELAY-1:"
+        guard value.count <= 32768, value.hasPrefix(prefix),
+              let raw = Data(base64Encoded: String(value.dropFirst(prefix.count))) else {
+            throw WardError("Paste the connection code printed by relay setup.")
+        }
+        let code = try JSONDecoder().decode(Self.self, from: raw)
+        guard code.version == 1, code.reader.utf8.count >= 32, code.enrollment.utf8.count >= 32,
+              code.reader != code.enrollment, !code.certificate.isEmpty, code.certificate.count <= 16384,
+              let url = URLComponents(string: code.origin), url.scheme == "https", url.host != nil,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              url.path.isEmpty || url.path == "/" else { throw WardError("Invalid relay connection code.") }
+        return code
+    }
+    var certificatePEM: Data {
+        Data(("-----BEGIN CERTIFICATE-----\n" + certificate.base64EncodedString(options: .lineLength64Characters) + "\n-----END CERTIFICATE-----\n").utf8)
+    }
+}
