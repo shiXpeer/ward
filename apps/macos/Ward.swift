@@ -5649,6 +5649,57 @@ private struct AppInstallRequest: Identifiable {
     let kind: AppInstallKind
 }
 
+private enum AppUpdateLifecycle {
+    static func isAlive(_ pid: pid_t) -> Bool {
+        guard pid > 0 else { return false }
+        return kill(pid, 0) == 0 || errno == EPERM
+    }
+    static func waitForExit(_ pids: [pid_t], timeout: Duration = .seconds(30),
+                            isAlive: (pid_t) -> Bool = Self.isAlive) async throws -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while pids.contains(where: isAlive) {
+            if ContinuousClock.now >= deadline { return false }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        return true
+    }
+    static func matches(_ url: URL, bundleID: String, version: String) -> Bool {
+        guard let data = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
+              let plist = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any] else { return false }
+        return plist["CFBundleIdentifier"] as? String == bundleID && plist["CFBundleShortVersionString"] as? String == version
+    }
+    static func progress(stage: String, bytes: Int64, total: Int64) -> Double {
+        if stage.hasPrefix("Downloading") { return 0.05 + (total > 0 ? Double(max(0, min(bytes, total))) / Double(total) * 0.60 : 0) }
+        if stage.hasPrefix("Unpacking") { return 0.70 }
+        if stage.hasPrefix("Verifying") { return 0.78 }
+        if stage.hasPrefix("Asking") || stage.hasPrefix("Waiting") { return 0.82 }
+        if stage.hasPrefix("Replacing") || stage.hasPrefix("Requesting administrator") { return 0.90 }
+        if stage.hasPrefix("Installed") || stage == "Update installed" { return 0.95 }
+        if stage.hasPrefix("Reopening") { return 0.97 }
+        return 0.02
+    }
+    static func shortStage(_ stage: String) -> String {
+        if stage.hasPrefix("Downloading") { return "Downloading…" }
+        if stage.hasPrefix("Replacing") { return "Installing…" }
+        if stage.hasPrefix("Installed") { return "Installed" }
+        return stage
+    }
+}
+
+/// SwiftUI's visibility preference still follows overlay scroller auto-hiding.
+/// Reserve a visible scrollbar so the queue length remains discoverable.
+private struct UpdateQueueScroller: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let scroll = view.enclosingScrollView else { return }
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = false
+            scroll.scrollerStyle = .legacy
+        }
+    }
+}
+
 private struct DetailRequest: Identifiable {
     let id = UUID()
     let findings: [Report.Finding]
@@ -5777,6 +5828,11 @@ struct ReportView: View {
     @State private var appUpdateBatch: AppUpdateBatch?
     @State private var updateAllResults: [String: String] = [:]
     @State private var stopUpdateAll = false
+    @State private var updateAllFinished = false
+    @State private var activeUpdateID: String?
+    @State private var updateProgress: [String: Double] = [:]
+    @State private var failedUpdateIDs = Set<String>()
+    @State private var warningUpdateIDs = Set<String>()
     @State private var appInstall: AppInstallRequest?
     @State private var installLog = ""
     @State private var installStage = ""
@@ -6516,66 +6572,102 @@ struct ReportView: View {
             return canReplaceInstalledApp(installed) || supportsAdminReplacement(installed)
         }
         return VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Update applications").font(.title2.bold())
-                Text(running ? "Save your work. Open apps will quit and reopen." : "Install the latest verified versions.")
-                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
-            }.frame(maxWidth: .infinity, minHeight: 52, maxHeight: 52, alignment: .topLeading)
-            ScrollView {
-                VStack(spacing: 10) {
-                    ForEach(requests) { request in
-                        HStack(spacing: 12) {
-                            Image(nsImage: applicationIcon(request.bundleID))
-                                .resizable().frame(width: 40, height: 40)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(request.name).font(.headline)
-                                Text("\(request.fromVersion) → \(request.toVersion)")
-                                    .font(.callout.monospaced()).foregroundStyle(.secondary)
-                                Text(updateAllResults[request.bundleID] ?? "Ready")
-                                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                                    .frame(height: 30, alignment: .topLeading).textSelection(.enabled)
-                            }
-                            Spacer(minLength: 0)
-                        }.frame(maxWidth: .infinity, alignment: .leading).padding(14).wardGlass(radius: 12)
-                    }
-                    if !installLog.isEmpty {
-                        DisclosureGroup("Details") {
-                            Text(installLog).font(.caption.monospaced()).textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                        }.font(.callout).padding(.horizontal, 4)
-                    }
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(updateAllFinished ? "Updates finished" : "Update applications").font(.title3.bold())
+                    Text(installing ? "Updating \(min(requests.count, updateAllResults.count + 1)) of \(requests.count)"
+                         : updateAllFinished ? "\(requests.count - failedUpdateIDs.count - (stopUpdateAll ? requests.filter { updateAllResults[$0.bundleID] == nil }.count : 0)) updated" + (failedUpdateIDs.isEmpty ? "" : " · \(failedUpdateIDs.count) failed") + (warningUpdateIDs.isEmpty ? "" : " · \(warningUpdateIDs.count) need reopening")
+                         : running ? "Open apps will quit and reopen." : "Install verified updates.")
+                        .font(.callout).foregroundStyle(.secondary).lineLimit(1)
                 }
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            ZStack(alignment: .leading) {
-                applicationInstallProgress
-                    .opacity(installing || !updateAllResults.isEmpty ? 1 : 0)
-                    .accessibilityHidden(!installing && updateAllResults.isEmpty)
-                if !canUpdate && !installing {
-                    Label("Update this app in the app itself.", systemImage: "lock.fill")
-                        .font(.callout).foregroundStyle(.orange)
-                }
-            }.frame(height: 44)
-            HStack {
-                Button("Close") { appUpdateBatch = nil; appInstall = nil }
-                    .wardGlassButton().disabled(installing)
                 Spacer()
-                if installing {
+                Text(requests.count.formatted() + (requests.count == 1 ? " app" : " apps"))
+                    .font(.callout).foregroundStyle(.secondary)
+            }.frame(height: 48, alignment: .top)
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(requests) { request in
+                        applicationUpdateQueueRow(request)
+                        if request.id != requests.last?.id { Divider().padding(.leading, 52) }
+                    }
+                }.padding(.trailing, 8)
+                    .background(UpdateQueueScroller())
+            }.scrollIndicators(.visible).frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack {
+                if updateAllFinished {
+                    Spacer()
+                    Button("Done") { appUpdateBatch = nil; appInstall = nil }
+                        .wardGlassButton(prominent: true).tint(.green).keyboardShortcut(.defaultAction)
+                } else if installing {
+                    Text("\(updateAllResults.count) / \(requests.count)").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    Spacer()
                     if requests.count > 1 {
                         Button(stopUpdateAll ? "Stopping…" : "Stop after this app") { stopUpdateAll = true }
                             .wardGlassButton().disabled(stopUpdateAll)
                     }
                 } else {
-                    Button(batch ? "Update all" : updateButtonTitle(requests.first?.bundleID ?? "")) {
+                    Button("Close") { appUpdateBatch = nil; appInstall = nil }.wardGlassButton()
+                    Spacer()
+                    if !canUpdate { Text("Update in the app itself.").font(.callout).foregroundStyle(.orange) }
+                    Button(batch ? (running ? "Quit, Update All & Reopen" : "Update all") : updateButtonTitle(requests.first?.bundleID ?? "")) {
                         runAllAppUpdates(requests)
-                    }.wardGlassButton(prominent: true)
-                        .disabled(!canUpdate || requests.allSatisfy { updateAllResults[$0.bundleID] != nil })
+                    }.wardGlassButton(prominent: true).disabled(!canUpdate)
                 }
             }.frame(height: 32)
-        }.padding(20).frame(width: 580, height: 188 + min(230, max(100, CGFloat(requests.count) * 96 + 26)))
-            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.10, blue: 0.28),
-                                                Color(red: 0.07, green: 0.06, blue: 0.14)],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing))
+        }.padding(20).frame(width: 600, height: 144 + min(320, max(104, CGFloat(requests.count) * 104)))
+            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.10, blue: 0.28), Color(red: 0.07, green: 0.06, blue: 0.14)], startPoint: .topLeading, endPoint: .bottomTrailing))
             .interactiveDismissDisabled(installing)
+            .onChange(of: installStage) { _, _ in captureUpdateProgress() }
+            .onChange(of: installBytes) { _, _ in captureUpdateProgress() }
+    }
+
+    private func applicationUpdateQueueRow(_ request: AppInstallRequest) -> some View {
+        let active = activeUpdateID == request.bundleID
+        let failed = failedUpdateIDs.contains(request.bundleID)
+        let warning = warningUpdateIDs.contains(request.bundleID)
+        let completed = updateAllResults[request.bundleID] != nil
+        let tint: Color = failed ? .red : warning ? .orange : completed ? .green : .accentColor
+        let status = active ? AppUpdateLifecycle.shortStage(installStage) : updateAllResults[request.bundleID] ?? (installing ? "Waiting…" : updateAllFinished ? "Skipped" : "Ready")
+        return HStack(alignment: .top, spacing: 12) {
+            Image(nsImage: applicationIcon(request.bundleID)).resizable().frame(width: 36, height: 36).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(request.name).font(.headline).lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("\(request.fromVersion) → \(request.toVersion)")
+                        .font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                }
+                ProgressView(value: updateProgress[request.bundleID] ?? 0).tint(tint)
+                    .progressViewStyle(.linear).frame(height: 6)
+                    .animation(.easeInOut(duration: 0.2), value: updateProgress[request.bundleID] ?? 0)
+                HStack(alignment: .top, spacing: 6) {
+                    if completed { Image(systemName: failed ? "exclamationmark.circle" : warning ? "exclamationmark.triangle" : "checkmark.circle.fill").foregroundStyle(tint) }
+                    Text(status).font(.callout).foregroundStyle(failed || warning ? tint : .secondary)
+                        .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading).help(status)
+                    if active && installTotal > 0 {
+                        Text("\(Int(Double(min(installBytes, installTotal)) / Double(installTotal) * 100))%")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }.frame(height: 32, alignment: .top)
+            }
+        }.padding(.vertical, 12).frame(height: 104)
+    }
+
+    private func captureUpdateProgress() {
+        guard let id = activeUpdateID else { return }
+        updateProgress[id] = max(updateProgress[id] ?? 0, AppUpdateLifecycle.progress(stage: installStage, bytes: installBytes, total: installTotal))
+    }
+
+    private func resetUpdateQueue() {
+        updateAllResults = [:]
+        updateAllFinished = false
+        activeUpdateID = nil
+        updateProgress = [:]
+        failedUpdateIDs = []
+        warningUpdateIDs = []
+        stopUpdateAll = false
+        installLog = ""
+        installMessage = ""
     }
 
     private var filteredApplications: [Report.Inventory.Application] {
@@ -6716,9 +6808,7 @@ struct ReportView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("Update") {
-                        updateAllResults = [:]
-                        installLog = ""
-                        installMessage = ""
+                        resetUpdateQueue()
                         appInstall = AppInstallRequest(bundleID: app.identifier, name: app.name,
                                                        fromVersion: shown, toVersion: reported,
                                                        kind: applicationInstallKind(app))
@@ -6770,27 +6860,6 @@ struct ReportView: View {
         return running ? "Quit, Update & Reopen" : "Update"
     }
 
-    private var applicationInstallProgress: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(installing ? (installStage.isEmpty ? "Preparing update…" : installStage)
-                 : (updateAllResults.isEmpty ? "Ready to update" : "Updates finished"))
-                .font(.callout.weight(.semibold)).lineLimit(1)
-                .frame(maxWidth: .infinity, minHeight: 16, maxHeight: 16, alignment: .leading)
-                .help(installStage)
-            ZStack {
-                ProgressView(value: installing ? (installTotal > 0 ? Double(min(installBytes, installTotal)) / Double(installTotal) : 0) : (updateAllResults.isEmpty ? 0 : 1))
-                    .opacity(installing && installTotal <= 0 ? 0 : 1)
-                if installing && installTotal <= 0 {
-                    ProgressView().progressViewStyle(.linear)
-                }
-            }.frame(height: 8)
-            Text(installing && installTotal > 0
-                 ? "\(ByteCountFormatter.string(fromByteCount: installBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: installTotal, countStyle: .file))"
-                 : " ")
-                .font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(height: 12)
-        }.frame(height: 44)
-    }
-
     private func installationDownloadProgress(_ received: Int64, _ total: Int64) {
         guard installStage.hasPrefix("Downloading") else { return }
         installStage = "Downloading update…"
@@ -6801,8 +6870,7 @@ struct ReportView: View {
     private func presentAllAppUpdates() {
         let requests = availableInstallRequests
         guard !requests.isEmpty else { return }
-        updateAllResults = [:]
-        installLog = ""
+        resetUpdateQueue()
         appUpdateBatch = AppUpdateBatch(requests: requests)
     }
 
@@ -6830,11 +6898,42 @@ struct ReportView: View {
         installStage = "Preparing " + request.name + "…"
         installBytes = 0
         installTotal = 0
-        let reopenURL: URL?
-        switch request.kind {
-        case .sparkle: reopenURL = try await installSparkleUpdate(request)
-        case .developerZip: reopenURL = try await installDeveloperZip(request)
-        case .vendorArchive: reopenURL = try await installVendorArchive(request)
+        guard let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID) else {
+            throw WardError("Application no longer installed.")
+        }
+        let target = installed.resolvingSymlinksInPath()
+        // Capture before download: an app can quit or update itself in the meantime.
+        let originalProcesses = NSRunningApplication.runningApplications(withBundleIdentifier: request.bundleID).filter {
+            $0.bundleURL?.resolvingSymlinksInPath() == target && AppUpdateLifecycle.isAlive($0.processIdentifier)
+        }
+        let originalPIDs = originalProcesses.map(\.processIdentifier)
+        let originalTeam = await Task.detached { signingTeam(installed) }.value
+        func verifyInstalled() async throws {
+            try await Task.detached {
+                guard AppUpdateLifecycle.matches(installed, bundleID: request.bundleID, version: request.toVersion) else {
+                    throw WardError("The installed version could not be confirmed. Check updates again.")
+                }
+                if let originalTeam {
+                    try verifyDeveloperUpdate(installed, bundleID: request.bundleID, team: originalTeam)
+                } else {
+                    try runTool("/usr/bin/codesign", ["--verify", "--strict", "--deep", installed.path])
+                }
+            }.value
+        }
+        var reopenURL: URL?
+        do {
+            switch request.kind {
+            case .sparkle: reopenURL = try await installSparkleUpdate(request)
+            case .developerZip: reopenURL = try await installDeveloperZip(request)
+            case .vendorArchive: reopenURL = try await installVendorArchive(request)
+            }
+            try await verifyInstalled()
+        } catch let installationError {
+            // A native updater may finish during quit, or replacement may finish
+            // before a later operation fails. Never infer success from exit status.
+            guard originalTeam != nil else { throw installationError }
+            do { try await verifyInstalled() } catch { throw installationError }
+            reopenURL = originalPIDs.isEmpty ? nil : installed
         }
         var record = updateChecks[request.bundleID] ?? AppUpdateRecord(
             text: "", newer: false, canInstall: false, reported: request.toVersion, installed: request.toVersion)
@@ -6846,16 +6945,40 @@ struct ReportView: View {
         updateChecks[request.bundleID] = record
         AppUpdateStore.save(updateChecks)
         model.updateAppBadge(updateChecks, for: Set(listedApplications.map(\.identifier)))
-        installMessage = "Updated to \(request.toVersion)."
+        installMessage = "Updated"
         installStage = "Update installed"
         installTotal = 0
-        if let reopenURL {
+        if reopenURL != nil || !originalPIDs.isEmpty {
+            // Do not silently force-quit an app with unsaved work. Distinguish an
+            // installed update from a restart that could not complete.
+            guard try await AppUpdateLifecycle.waitForExit(originalPIDs, timeout: .seconds(2)) else {
+                warningUpdateIDs.insert(request.bundleID)
+                installMessage = "Updated · still open; quit and reopen to finish"
+                return
+            }
+            // A native updater may have relaunched the new copy itself.
+            let alreadyReopened = NSRunningApplication.runningApplications(withBundleIdentifier: request.bundleID).contains {
+                $0.bundleURL?.resolvingSymlinksInPath() == target &&
+                    !originalPIDs.contains($0.processIdentifier) && AppUpdateLifecycle.isAlive($0.processIdentifier)
+            }
+            if alreadyReopened {
+                installMessage = "Updated · reopened"
+                return
+            }
             do {
                 installStage = "Reopening " + request.name + "…"
-                _ = try await NSWorkspace.shared.openApplication(at: reopenURL, configuration: .init())
-                installMessage += " Reopened \(request.name)."
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = false
+                configuration.createsNewApplicationInstance = true
+                let reopened = try await NSWorkspace.shared.openApplication(at: installed, configuration: configuration)
+                guard AppUpdateLifecycle.isAlive(reopened.processIdentifier) else {
+                    throw WardError("The application exited immediately.")
+                }
+                installMessage = "Updated · reopened"
             } catch {
-                installMessage += " Could not reopen \(request.name): \(error.localizedDescription)"
+                warningUpdateIDs.insert(request.bundleID)
+                installMessage = "Updated · could not reopen; open the app manually"
+                installLog += "Reopen failed: " + error.localizedDescription + "\n"
             }
         }
     }
@@ -6865,16 +6988,23 @@ struct ReportView: View {
         model.installingApplication = true
         stopUpdateAll = false
         Task {
-            defer { model.installingApplication = false }
+            defer {
+                activeUpdateID = nil
+                updateAllFinished = true
+                model.installingApplication = false
+            }
             for request in requests {
                 if stopUpdateAll { break }
                 guard updateAllResults[request.bundleID] == nil else { continue }
-                updateAllResults[request.bundleID] = "Downloading and verifying…"
+                activeUpdateID = request.bundleID
+                updateProgress[request.bundleID] = 0.02
                 installLog = ""
                 do {
                     try await performAppUpdate(request)
                     updateAllResults[request.bundleID] = installMessage
+                    updateProgress[request.bundleID] = 1
                 } catch {
+                    failedUpdateIDs.insert(request.bundleID)
                     updateAllResults[request.bundleID] = error.localizedDescription
                 }
             }
@@ -7121,7 +7251,7 @@ struct ReportView: View {
         let target = installed.resolvingSymlinksInPath()
         func runningCopies() -> [NSRunningApplication] {
             NSRunningApplication.runningApplications(withBundleIdentifier: request.bundleID).filter {
-                $0.bundleURL?.resolvingSymlinksInPath() == target && !$0.isTerminated
+                $0.bundleURL?.resolvingSymlinksInPath() == target && AppUpdateLifecycle.isAlive($0.processIdentifier)
             }
         }
         let running = runningCopies()
@@ -7132,32 +7262,26 @@ struct ReportView: View {
                     throw WardError("Could not ask \(request.name) to quit. Close it and try again.")
                 }
             }
-            let deadline = ContinuousClock.now + .seconds(30)
-            while running.contains(where: { !$0.isTerminated }) {
-                guard ContinuousClock.now < deadline else {
-                    throw WardError("\(request.name) is still open. Save your work and quit it, then try again.")
-                }
-                try await Task.sleep(for: .milliseconds(200))
+            guard try await AppUpdateLifecycle.waitForExit(running.map(\.processIdentifier)) else {
+                throw WardError("Could not close \(request.name). Your work was left open.")
             }
         }
         guard runningCopies().isEmpty else {
             throw WardError("\(request.name) reopened before installation. Close it and try again.")
         }
         log("Replacing \(installed.path).")
-        let replacement: URL?
         if let requirement {
             log("Requesting administrator approval from macOS.")
             try await replaceAppWithApproval(installed, unpacked: unpacked, requirement: requirement,
                                              version: request.toVersion)
-            replacement = installed
         } else {
-            replacement = try await Task.detached {
+            _ = try await Task.detached {
                 try FileManager.default.replaceItemAt(installed, withItemAt: unpacked,
                                                       backupItemName: nil, options: .usingNewMetadataOnly)
             }.value
         }
         log("Installed \(request.toVersion).")
-        return running.isEmpty ? nil : (replacement ?? installed)
+        return running.isEmpty ? nil : installed
     }
 
     private var packagesPage: some View {

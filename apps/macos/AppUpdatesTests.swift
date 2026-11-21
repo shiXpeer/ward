@@ -18,10 +18,52 @@ import zlib
         append(28,2); append(1,2); append(UInt64(compressed),8); append(UInt64(expanded),8); append(0,4)
         return data
     }
-    static func main() throws {
+    static func main() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        let app = root.appendingPathComponent("Fixture.app")
+        let contents = app.appendingPathComponent("Contents")
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        let plist = contents.appendingPathComponent("Info.plist")
+        func writeVersion(_ version: String, id: String = "org.example.fixture") throws {
+            try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": id, "CFBundleShortVersionString": version], format: .xml, options: 0).write(to: plist, options: .atomic)
+        }
+        try writeVersion("1.0")
+        precondition(!AppUpdateLifecycle.matches(app, bundleID: "org.example.fixture", version: "2.0"))
+        try writeVersion("2.0")
+        precondition(AppUpdateLifecycle.matches(app, bundleID: "org.example.fixture", version: "2.0"))
+        precondition(!AppUpdateLifecycle.matches(app, bundleID: "org.example.other", version: "2.0"))
+        try Data("not a plist".utf8).write(to: plist)
+        precondition(!AppUpdateLifecycle.matches(app, bundleID: "org.example.fixture", version: "2.0"))
+        var polls = 0
+        let exited = try await AppUpdateLifecycle.waitForExit([123], timeout: .seconds(1)) { _ in
+            polls += 1; return polls < 3
+        }
+        precondition(exited && polls == 3, "Must re-query process liveness, not retain a snapshot")
+        let blocked = try await AppUpdateLifecycle.waitForExit([123], timeout: .zero) { _ in true }
+        precondition(!blocked, "A running app must block replacement")
+        let notRunning = try await AppUpdateLifecycle.waitForExit([], timeout: .zero) { _ in true }
+        precondition(notRunning)
+        precondition(!AppUpdateLifecycle.isAlive(-1))
+        precondition(AppUpdateLifecycle.progress(stage: "Downloading update…", bytes: 50, total: 100) == 0.35)
+        precondition(AppUpdateLifecycle.progress(stage: "Replacing /Applications/Fixture.app", bytes: 0, total: 0) == 0.90)
+        print("PASS: installed-version reconciliation, process exit polling/timeout, progress stages")
+        let fixtureApp = URL(fileURLWithPath: ProcessInfo.processInfo.environment["WARD_TEST_LIFECYCLE_APP"]!)
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.createsNewApplicationInstance = true
+        let first = try await NSWorkspace.shared.openApplication(at: fixtureApp, configuration: configuration)
+        precondition(AppUpdateLifecycle.isAlive(first.processIdentifier))
+        precondition(first.terminate())
+        let closed = try await AppUpdateLifecycle.waitForExit([first.processIdentifier], timeout: .seconds(10))
+        precondition(closed, "Fixture did not quit")
+        let reopened = try await NSWorkspace.shared.openApplication(at: fixtureApp, configuration: configuration)
+        precondition(AppUpdateLifecycle.isAlive(reopened.processIdentifier) && reopened.processIdentifier != first.processIdentifier)
+        precondition(reopened.terminate())
+        let closedAgain = try await AppUpdateLifecycle.waitForExit([reopened.processIdentifier], timeout: .seconds(10))
+        precondition(closedAgain)
+        print("PASS: real isolated app quit and reopen at its original bundle path")
         let executable = root.appendingPathComponent("Fixture")
         let mapping = #"const links={macos:"https://updates.example/app-intel.pkg",macos_m1:"https://updates.example/app-arm.pkg"}"#
         var binary = Data(repeating: 0, count: 1024 * 1024 - 20)
