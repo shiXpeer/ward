@@ -42,6 +42,57 @@ import zlib
         precondition(AppUpdateAlerts.pending([system[0].id: systemRecord], notified: [:]).count == 1)
         precondition(AppUpdateAlerts.pending([system[0].id: systemRecord], notified: [system[0].id: "2.0"]).isEmpty)
         print("PASS: native system update parsing, incomplete-response rejection and alert deduplication")
+        precondition(system[1].requiresRestart && !system[0].requiresRestart)
+        let oldSystemCache = try JSONDecoder().decode(SystemSoftwareUpdate.self, from: Data(#"{"label":"Fixture-1","title":"Fixture","version":"1"}"#.utf8))
+        precondition(!oldSystemCache.requiresRestart && oldSystemCache.pendingRestart == nil)
+        let downloading = SystemInstallProgress.latest("Downloading: 12.5%\rDownloading: 55.0%")!
+        precondition(downloading.stage == "Downloading update…" && downloading.percent == 55)
+        let installing = SystemInstallProgress.latest("Downloaded Fixture\nInstalling: 23.5%")!
+        precondition(installing.stage == "Installing update…" && installing.percent == 23.5)
+        precondition(installing.fraction > downloading.fraction)
+        precondition(SystemInstallProgress.latest("Installing: 999%")?.percent == 100)
+        precondition(SystemInstallProgress.latest("no progress here") == nil)
+        try SystemUpdateInstaller.validate("Fixture Tools-2.0")
+        for label in ["", "--all", "Fixture\n--restart", String(repeating: "x", count: 513)] {
+            do { try SystemUpdateInstaller.validate(label); fatalError("Invalid label accepted") } catch {}
+        }
+        let installedSystem = try SystemUpdateInstaller.verify(system[0], exitCode: 0, output: "Done with Fixture Tools\nDone.", remaining: [])
+        precondition(installedSystem == .installed)
+        let preparedSystem = try SystemUpdateInstaller.verify(system[1], exitCode: 0, output: "Done with macOS Fixture. You must restart your computer.", remaining: [])
+        precondition(preparedSystem == .restartRequired)
+        do { _ = try SystemUpdateInstaller.verify(system[0], exitCode: 1, output: "Done with Fixture", remaining: []); fatalError("Failed exit accepted") } catch {}
+        do { _ = try SystemUpdateInstaller.verify(system[0], exitCode: 0, output: "No updates are available.", remaining: []); fatalError("No-op accepted as installed") } catch {}
+        do { _ = try SystemUpdateInstaller.verify(system[0], exitCode: 0, output: "Done with Fixture Tools", remaining: [system[0]]); fatalError("Still offered accepted") } catch {}
+        precondition(SystemUpdateInstaller.failure("Failed to authenticate as volume owner").localizedDescription.contains("owner authorization"))
+        precondition(!SystemUpdateInstaller.launchScript.contains("--restart"))
+        precondition(!SystemUpdateInstaller.launchScript.contains("--all"))
+        precondition(!SystemUpdateInstaller.launchScript.contains("--agree-to-license"))
+        // Exercise the production launch/progress/exit-file shell protocol with
+        // an unprivileged local fixture, never the real system updater.
+        let fakeUpdater = root.appendingPathComponent("fake-softwareupdate")
+        let argumentsFile = root.appendingPathComponent("native-arguments")
+        let fakeBody = "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + ServerEnrollmentCommand.quote(argumentsFile.path) + "\nprintf 'Downloading: 50%%\\n'\nsleep 0.2\nprintf 'Installing: 100%%\\nDone with Fixture Tools\\n'\n"
+        try Data(fakeBody.utf8).write(to: fakeUpdater)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeUpdater.path)
+        let fixtureScript = SystemUpdateInstaller.launchScript
+            .replacingOccurrences(of: "/usr/sbin/softwareupdate", with: ServerEnrollmentCommand.quote(fakeUpdater.path))
+            .replacingOccurrences(of: "/Library/Application Support/.ward-system-update.XXXXXXXX", with: root.path + "/native.XXXXXXXX")
+            .replacingOccurrences(of: "(/bin/sleep 600; /bin/rm -rf -- \"$work\") </dev/null >/dev/null 2>&1 &", with: ":")
+        let labelWithShellText = "Fixture Tools; $(echo should-not-run)"
+        let nativeRoot = try toolResult("/bin/sh", ["-c", fixtureScript, "fixture", labelWithShellText]).stdout
+        let statusFile = URL(fileURLWithPath: nativeRoot).appendingPathComponent("status")
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: statusFile.path) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let exitStatus = try String(contentsOf: statusFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        precondition(exitStatus == "0")
+        let nativeArguments = try String(contentsOf: argumentsFile, encoding: .utf8).split(separator: "\n").map(String.init)
+        precondition(nativeArguments == ["--install", labelWithShellText, "--verbose"])
+        let progressOutput = try String(contentsOf: URL(fileURLWithPath: nativeRoot).appendingPathComponent("output"), encoding: .utf8)
+        precondition(SystemInstallProgress.latest(progressOutput)?.percent == 100)
+        print("PASS: system installation staging, exact label arguments, streamed progress, failure/no-op rejection and restart result")
+
         let app = root.appendingPathComponent("Fixture.app")
         let contents = app.appendingPathComponent("Contents")
         try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)

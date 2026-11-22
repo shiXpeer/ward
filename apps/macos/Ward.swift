@@ -971,7 +971,7 @@ private struct WardPreferences: Codable {
         applicationUpdateNote = "Checking macOS software updates…"
         switch await systemCheck {
         case .success(let updates):
-            systemSoftwareUpdates = updates
+            systemSoftwareUpdates = SystemSoftwareUpdate.mergingRestartPending(updates)
             systemUpdateCheckNote = ""
             if let data = try? JSONEncoder().encode(updates) { UserDefaults.standard.set(data, forKey: "ward.system-software-updates.v1") }
         case .failure(let error):
@@ -4353,6 +4353,9 @@ private struct SystemSoftwareUpdate: Codable, Identifiable, Equatable {
     let label: String
     let title: String
     let version: String
+    var action: String? = nil
+    var pendingRestart: Bool? = nil
+    var requiresRestart: Bool { action == "restart" || action == "shutdown" }
     var id: String { "system-software:" + label }
     static func parse(_ output: String) throws -> [Self] {
         var label: String?
@@ -4365,7 +4368,8 @@ private struct SystemSoftwareUpdate: Codable, Identifiable, Equatable {
                 let title = String(line[line.index(line.startIndex, offsetBy: 7)..<split.lowerBound])
                 let version = String(line[split.upperBound...].prefix { $0 != "," }).trimmingCharacters(in: .whitespaces)
                 guard !title.isEmpty, !version.isEmpty else { throw WardError("Incomplete system update response.") }
-                updates.append(Self(label: current, title: title, version: version))
+                let action = line.range(of: ", Action: ").map { String(line[$0.upperBound...].prefix { $0 != "," }).trimmingCharacters(in: .whitespaces).lowercased() }
+                updates.append(Self(label: current, title: title, version: version, action: action))
                 label = nil
             }
         }
@@ -4396,9 +4400,163 @@ private struct SystemSoftwareUpdate: Codable, Identifiable, Equatable {
         guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 1 << 20 else { throw WardError("System update response is too large.") }
         return try parse(String(decoding: Data(contentsOf: file), as: UTF8.self))
     }
+    static func mergingRestartPending(_ updates: [Self]) -> [Self] {
+        let defaults = UserDefaults.standard
+        let boot = Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime
+        guard abs(defaults.double(forKey: "ward.system-update-restart-boot") - boot) < 5,
+              let data = defaults.data(forKey: "ward.system-update-restart-items"),
+              let pending = try? JSONDecoder().decode([Self].self, from: data) else { return updates.filter { $0.pendingRestart != true } }
+        let ids = Set(pending.map(\.id))
+        return updates.filter { $0.pendingRestart != true && !ids.contains($0.id) } + pending
+    }
+    static func rememberRestart(_ update: Self) {
+        var pending = mergingRestartPending([])
+        pending.removeAll { $0.id == update.id }
+        var item = update; item.pendingRestart = true; pending.append(item)
+        let defaults = UserDefaults.standard
+        defaults.set(Date().timeIntervalSince1970 - ProcessInfo.processInfo.systemUptime, forKey: "ward.system-update-restart-boot")
+        if let data = try? JSONEncoder().encode(pending) { defaults.set(data, forKey: "ward.system-update-restart-items") }
+    }
     static func load() -> [Self] {
-        guard let data = UserDefaults.standard.data(forKey: "ward.system-software-updates.v1") else { return [] }
-        return (try? JSONDecoder().decode([Self].self, from: data)) ?? []
+        let data = UserDefaults.standard.data(forKey: "ward.system-software-updates.v1") ?? Data()
+        return mergingRestartPending((try? JSONDecoder().decode([Self].self, from: data)) ?? [])
+    }
+}
+
+private struct SystemInstallProgress: Equatable {
+    let stage: String
+    let percent: Double?
+    var fraction: Double {
+        let value = max(0, min(100, percent ?? 0)) / 100
+        switch stage {
+        case "Downloading update…": return 0.05 + 0.60 * value
+        case "Installing update…": return 0.70 + 0.28 * value
+        case "Verifying update…": return 0.68
+        default: return 0.02
+        }
+    }
+    static func latest(_ output: String) -> Self? {
+        var result: Self?
+        for line in output.components(separatedBy: .newlines).flatMap({ $0.components(separatedBy: "\r") }) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            let stage: String
+            if text.hasPrefix("Downloading") || text.hasPrefix("Downloaded") { stage = "Downloading update…" }
+            else if text.hasPrefix("Installing") || text.hasPrefix("Preparing") { stage = "Installing update…" }
+            else if text.hasPrefix("Verifying") { stage = "Verifying update…" }
+            else { continue }
+            let percent: Double?
+            if let range = text.range(of: #"[0-9]+(?:\.[0-9]+)?\s*%"#, options: .regularExpression) {
+                let value = Double(text[range].replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces))
+                percent = value.flatMap { $0.isFinite ? min(100, max(0, $0)) : nil }
+            } else { percent = text.hasPrefix("Downloaded") ? 100 : nil }
+            result = Self(stage: stage, percent: percent)
+        }
+        return result
+    }
+}
+
+private enum SystemUpdateInstaller {
+    enum Outcome: Equatable { case installed, restartRequired }
+    // Only Apple's fixed updater is privileged; no user-provided executable,
+    // script, download URL or writable log path is executed as administrator.
+    static let launchScript = #"""
+        set -eu
+        label=$1
+        export LC_ALL=C LANG=en_US.UTF-8
+        work=$(/usr/bin/mktemp -d '/Library/Application Support/.ward-system-update.XXXXXXXX')
+        /bin/chmod 755 "$work"
+        : > "$work/output"
+        /bin/chmod 644 "$work/output"
+        (
+            set +e
+            /usr/sbin/softwareupdate --install "$label" --verbose </dev/null > "$work/output" 2>&1
+            result=$?
+            /usr/bin/printf '%s\n' "$result" > "$work/status.pending"
+            /bin/chmod 644 "$work/status.pending"
+            /bin/mv "$work/status.pending" "$work/status"
+            (/bin/sleep 600; /bin/rm -rf -- "$work") </dev/null >/dev/null 2>&1 &
+        ) </dev/null >/dev/null 2>&1 &
+        /usr/bin/printf '%s' "$work"
+        """#
+    static let authorizationScript = """
+        on run argv
+            set cmd to "/bin/sh -c " & quoted form of (item 1 of argv) & " ward-system-update " & quoted form of (item 2 of argv)
+            do shell script cmd with administrator privileges
+        end run
+        """
+    static func validate(_ label: String) throws {
+        guard !label.isEmpty, label.utf8.count <= 512, !label.hasPrefix("-"),
+              !label.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            throw WardError("Invalid system update label. Check updates again.")
+        }
+    }
+    static func failure(_ output: String) -> WardError {
+        let lower = output.lowercased()
+        if lower.contains("authenticate") || lower.contains("volume owner") || lower.contains("--stdinpass") {
+            return WardError("macOS requires owner authorization for this update. Complete it in Software Update.")
+        }
+        let detail = output.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.last { !$0.isEmpty } ?? "Try again."
+        return WardError("System update failed. " + String(detail.prefix(200)))
+    }
+    static func verify(_ update: SystemSoftwareUpdate, exitCode: Int, output: String,
+                       remaining: [SystemSoftwareUpdate]) throws -> Outcome {
+        guard exitCode == 0 else { throw failure(output) }
+        let lower = output.lowercased()
+        guard lower.contains("done with ") || lower.contains("successfully installed") || lower.components(separatedBy: .newlines).contains(where: { $0.hasPrefix("installed ") }) else {
+            throw WardError("macOS did not confirm installation. Check updates again.")
+        }
+        let restart = update.requiresRestart || lower.contains("restart is required") || lower.contains("requires that you restart") || lower.contains("must restart") || lower.contains("restart your computer") || lower.contains("restart your mac")
+        if remaining.contains(where: { $0.label == update.label }) {
+            guard restart && (lower.contains("done with") || lower.contains("successfully installed")) else {
+                throw WardError("macOS still offers this update. Installation was not confirmed.")
+            }
+        }
+        return restart ? .restartRequired : .installed
+    }
+    static func install(_ update: SystemSoftwareUpdate,
+                        progress: @escaping @MainActor @Sendable (SystemInstallProgress) -> Void) async throws -> (Outcome, [SystemSoftwareUpdate]) {
+        try validate(update.label)
+        await progress(SystemInstallProgress(stage: "Checking update availability…", percent: nil))
+        let offered = try await Task.detached { try SystemSoftwareUpdate.check() }.value
+        guard offered.contains(where: { $0.label == update.label && $0.version == update.version }) else {
+            throw WardError("This update is no longer offered. Check updates again.")
+        }
+        await progress(SystemInstallProgress(stage: "Waiting for macOS approval…", percent: nil))
+        let work = try await Task.detached {
+            try toolResult("/usr/bin/osascript", ["-e", authorizationScript, launchScript, update.label]).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.value
+        guard work.range(of: #"^/Library/Application Support/\.ward-system-update\.[A-Za-z0-9]+$"#, options: .regularExpression) != nil else {
+            throw WardError("System update could not start.")
+        }
+        let root = URL(fileURLWithPath: work)
+        let deadline = ContinuousClock.now + .seconds(7200)
+        var previous: SystemInstallProgress?
+        var output = ""
+        while true {
+            let snapshot = try await Task.detached { () -> (String, Int?) in
+                let file = root.appendingPathComponent("output")
+                let handle = try FileHandle(forReadingFrom: file)
+                defer { try? handle.close() }
+                // Read a bounded tail, even if the system updater is verbose.
+                let length = try handle.seekToEnd()
+                try handle.seek(toOffset: length > 262144 ? length - 262144 : 0)
+                let data = try handle.read(upToCount: 262144) ?? Data()
+                let status = try? String(contentsOf: root.appendingPathComponent("status"), encoding: .utf8)
+                return (String(decoding: data, as: UTF8.self), status.flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+            }.value
+            output = snapshot.0
+            if let value = SystemInstallProgress.latest(output), value != previous {
+                await progress(value); previous = value
+            }
+            if let status = snapshot.1 {
+                guard status == 0 else { throw failure(output) }
+                await progress(SystemInstallProgress(stage: "Verifying update…", percent: nil))
+                let remaining = try await Task.detached { try SystemSoftwareUpdate.check() }.value
+                return (try verify(update, exitCode: status, output: output, remaining: remaining), remaining)
+            }
+            guard ContinuousClock.now < deadline else { throw WardError("macOS is still updating. Check updates before retrying; installation has not been cancelled.") }
+            try await Task.sleep(for: .milliseconds(300))
+        }
     }
 }
 
@@ -5706,6 +5864,7 @@ private enum AppInstallKind {
     case sparkle
     case developerZip
     case vendorArchive
+    case system(SystemSoftwareUpdate)
 }
 
 private struct AppInstallRequest: Identifiable {
@@ -5715,6 +5874,10 @@ private struct AppInstallRequest: Identifiable {
     let fromVersion: String
     let toVersion: String
     let kind: AppInstallKind
+    var systemUpdate: SystemSoftwareUpdate? {
+        if case .system(let update) = kind { return update }
+        return nil
+    }
 }
 
 private enum AppUpdateLifecycle {
@@ -6617,9 +6780,14 @@ struct ReportView: View {
                             Text("Version " + update.version + " · macOS Software Update").font(.callout).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Open Software Update") {
-                            if let url = URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension") { NSWorkspace.shared.open(url) }
-                        }.wardGlassButton()
+                        if update.pendingRestart == true {
+                            Label("Restart required", systemImage: "restart").font(.callout).foregroundStyle(.orange)
+                        } else {
+                            Button("Update") {
+                                resetUpdateQueue()
+                                appInstall = systemInstallRequest(update)
+                            }.wardGlassButton(prominent: true).disabled(installing || checkingUpdates || model.busy)
+                        }
                     }.padding(16).wardGlass(radius: 18)
                 }
             }
@@ -6654,20 +6822,23 @@ struct ReportView: View {
     private func applicationUpdateSheet(_ requests: [AppInstallRequest], batch: Bool) -> some View {
         let running = requests.contains { updateButtonTitle($0.bundleID) != "Update" }
         let canUpdate = !requests.isEmpty && requests.allSatisfy { request in
+            if request.systemUpdate != nil { return true }
             guard let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID) else { return false }
             return canReplaceInstalledApp(installed) || supportsAdminReplacement(installed)
         }
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(updateAllFinished ? "Updates finished" : "Update applications").font(.title3.bold())
+                    Text(updateAllFinished ? "Updates finished" : "Install updates").font(.title3.bold())
                     Text(installing ? "Updating \(min(requests.count, updateAllResults.count + 1)) of \(requests.count)"
-                         : updateAllFinished ? "\(requests.count - failedUpdateIDs.count - (stopUpdateAll ? requests.filter { updateAllResults[$0.bundleID] == nil }.count : 0)) updated" + (failedUpdateIDs.isEmpty ? "" : " · \(failedUpdateIDs.count) failed") + (warningUpdateIDs.isEmpty ? "" : " · \(warningUpdateIDs.count) need reopening")
+                         : updateAllFinished ? "\(requests.count - failedUpdateIDs.count - (stopUpdateAll ? requests.filter { updateAllResults[$0.bundleID] == nil }.count : 0)) updated" + (failedUpdateIDs.isEmpty ? "" : " · \(failedUpdateIDs.count) failed") + (warningUpdateIDs.isEmpty ? "" : " · \(warningUpdateIDs.count) need attention")
+                         : requests.contains(where: { $0.systemUpdate?.requiresRestart == true }) ? "Restart required afterwards · no automatic restart."
+                         : requests.contains(where: { $0.systemUpdate != nil }) ? "macOS may ask for administrator approval."
                          : running ? "Open apps will quit and reopen." : "Install verified updates.")
                         .font(.callout).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
-                Text(requests.count.formatted() + (requests.count == 1 ? " app" : " apps"))
+                Text(requests.count.formatted() + (requests.count == 1 ? " update" : " updates"))
                     .font(.callout).foregroundStyle(.secondary)
             }.frame(height: 48, alignment: .top)
             ScrollView {
@@ -6715,12 +6886,15 @@ struct ReportView: View {
         let tint: Color = failed ? .red : warning ? .orange : completed ? .green : .accentColor
         let status = active ? AppUpdateLifecycle.shortStage(installStage) : updateAllResults[request.bundleID] ?? (installing ? "Waiting…" : updateAllFinished ? "Skipped" : "Ready")
         return HStack(alignment: .top, spacing: 12) {
-            Image(nsImage: applicationIcon(request.bundleID)).resizable().frame(width: 36, height: 36).padding(.top, 2)
+            Group {
+                if request.systemUpdate != nil { Image(systemName: "gearshape.arrow.triangle.2.circlepath").resizable().scaledToFit().foregroundStyle(.blue) }
+                else { Image(nsImage: applicationIcon(request.bundleID)).resizable() }
+            }.frame(width: 36, height: 36).padding(.top, 2)
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(request.name).font(.headline).lineLimit(1)
                     Spacer(minLength: 8)
-                    Text("\(request.fromVersion) → \(request.toVersion)")
+                    Text(request.fromVersion.isEmpty ? request.toVersion : "\(request.fromVersion) → \(request.toVersion)")
                         .font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                 }
                 ProgressView(value: updateProgress[request.bundleID] ?? 0).tint(tint)
@@ -6740,7 +6914,7 @@ struct ReportView: View {
     }
 
     private func captureUpdateProgress() {
-        guard let id = activeUpdateID else { return }
+        guard let id = activeUpdateID, !id.hasPrefix("system-software:") else { return }
         updateProgress[id] = max(updateProgress[id] ?? 0, AppUpdateLifecycle.progress(stage: installStage, bytes: installBytes, total: installTotal))
     }
 
@@ -6824,8 +6998,8 @@ struct ReportView: View {
             }
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 4) {
-                if let tone {
-                    Text(newer ? "Update available" : (current ? "Installed" : "No check"))
+                if let tone, !current {
+                    Text(newer ? "Update available" : "No check")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(tone)
                 }
@@ -6968,8 +7142,12 @@ struct ReportView: View {
         }
     }
 
+    private func systemInstallRequest(_ update: SystemSoftwareUpdate) -> AppInstallRequest {
+        AppInstallRequest(bundleID: update.id, name: update.title, fromVersion: "", toVersion: update.version, kind: .system(update))
+    }
+
     private var availableInstallRequests: [AppInstallRequest] {
-        listedApplications.compactMap { app in
+        let applications: [AppInstallRequest] = listedApplications.compactMap { app in
             guard let record = updateChecks[app.identifier], record.newer, record.canInstall,
                   app.identifier != Bundle.main.bundleIdentifier,
                   let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier),
@@ -6978,12 +7156,36 @@ struct ReportView: View {
                                      fromVersion: liveVersion(app), toVersion: record.reported,
                                      kind: applicationInstallKind(app))
         }
+        return applications + (device.id == "local" ? model.systemSoftwareUpdates.filter { $0.pendingRestart != true }.map(systemInstallRequest) : [])
     }
 
     private func performAppUpdate(_ request: AppInstallRequest) async throws {
         installStage = "Preparing " + request.name + "…"
         installBytes = 0
         installTotal = 0
+        if let update = request.systemUpdate {
+            installStage = "Waiting for macOS approval…"
+            let (outcome, remaining) = try await SystemUpdateInstaller.install(update) { progress in
+                installStage = progress.stage
+                installBytes = Int64(progress.percent ?? 0)
+                installTotal = progress.percent == nil ? 0 : 100
+                updateProgress[request.bundleID] = max(updateProgress[request.bundleID] ?? 0, progress.fraction)
+            }
+            if outcome == .restartRequired { SystemSoftwareUpdate.rememberRestart(update) }
+            model.systemSoftwareUpdates = SystemSoftwareUpdate.mergingRestartPending(remaining)
+            model.systemUpdateCheckNote = ""
+            if let data = try? JSONEncoder().encode(remaining) { UserDefaults.standard.set(data, forKey: "ward.system-software-updates.v1") }
+            model.updateAppBadge(updateChecks, for: Set(listedApplications.map(\.identifier)))
+            switch outcome {
+            case .installed: installMessage = "Updated"
+            case .restartRequired:
+                warningUpdateIDs.insert(request.bundleID)
+                installMessage = "Prepared · restart your Mac to finish"
+            }
+            installStage = "Update installed"
+            installTotal = 0
+            return
+        }
         guard let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID) else {
             throw WardError("Application no longer installed.")
         }
@@ -7012,6 +7214,7 @@ struct ReportView: View {
             case .sparkle: reopenURL = try await installSparkleUpdate(request)
             case .developerZip: reopenURL = try await installDeveloperZip(request)
             case .vendorArchive: reopenURL = try await installVendorArchive(request)
+            case .system: throw WardError("Unexpected system update request.")
             }
             try await verifyInstalled()
         } catch let installationError {
