@@ -6825,13 +6825,13 @@ struct ReportView: View {
             Spacer(minLength: 12)
             VStack(alignment: .trailing, spacing: 4) {
                 if let tone {
-                    Text(newer ? "Update available" : (current ? "Up to date" : "No check"))
+                    Text(newer ? "Update available" : (current ? "Installed" : "No check"))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(tone)
                 }
                 Text(shown.isEmpty ? "Version unavailable" : shown)
                     .font(.callout.monospaced())
-                if let record {
+                if let record, !current {
                     Text(record.text).font(.caption).foregroundStyle(.secondary)
                         .multilineTextAlignment(.trailing)
                 } else if unchecked {
