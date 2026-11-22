@@ -22,6 +22,26 @@ import zlib
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        let systemOutput = """
+        Software Update Tool
+        Finding available software
+        Software Update found the following new or updated software:
+        * Label: FixtureTools-2.0
+            Title: Fixture Tools, Version: 2.0, Size: 123KiB, Recommended: YES,
+        * Label: OS-27.1
+            Title: macOS Fixture, Version: 27.1, Size: 456KiB, Recommended: YES, Action: restart,
+        """
+        let system = try SystemSoftwareUpdate.parse(systemOutput)
+        precondition(system.count == 2 && system[0].title == "Fixture Tools" && system[0].version == "2.0")
+        precondition(system[1].id == "system-software:OS-27.1")
+        let noSystemUpdates = try SystemSoftwareUpdate.parse("No new software available.")
+        precondition(noSystemUpdates.isEmpty)
+        do { _ = try SystemSoftwareUpdate.parse("Finding available software"); fatalError("Incomplete response accepted") } catch {}
+        do { _ = try SystemSoftwareUpdate.parse("* Label: Fixture-2\nTitle: Fixture, Version: , Size: 1KiB"); fatalError("Missing version accepted") } catch {}
+        let systemRecord = AppUpdateRecord(text: "Available", newer: true, canInstall: false, reported: "2.0", installed: "")
+        precondition(AppUpdateAlerts.pending([system[0].id: systemRecord], notified: [:]).count == 1)
+        precondition(AppUpdateAlerts.pending([system[0].id: systemRecord], notified: [system[0].id: "2.0"]).isEmpty)
+        print("PASS: native system update parsing, incomplete-response rejection and alert deduplication")
         let app = root.appendingPathComponent("Fixture.app")
         let contents = app.appendingPathComponent("Contents")
         try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)

@@ -585,8 +585,10 @@ private struct WardPreferences: Codable {
         currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil
     })
 
+    @Published fileprivate var systemSoftwareUpdates = SystemSoftwareUpdate.load()
+    @Published fileprivate var systemUpdateCheckNote = ""
     fileprivate func updateAppBadge(_ results: [String: AppUpdateRecord], for identifiers: Set<String>) {
-        availableAppUpdateIDs = Set(results.compactMap { identifiers.contains($0.key) && currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil })
+        availableAppUpdateIDs = Set(results.compactMap { identifiers.contains($0.key) && currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil }).union(systemSoftwareUpdates.map(\.id))
     }
 
     @Published var applicationCheckProgress: (completed: Int, total: Int)?
@@ -946,18 +948,17 @@ private struct WardPreferences: Codable {
         }
         let minimumEnd = ContinuousClock.now + .milliseconds(900)
         let jobs = await Task.detached { updateJobs(for: apps) }.value
-        guard !jobs.isEmpty else {
-            applicationUpdateNote = "No application update channels found."
-            return
-        }
-        if showProgress { applicationCheckProgress = (0, jobs.count) }
+        async let systemCheck: Result<[SystemSoftwareUpdate], Error> = Task.detached {
+            Result { try SystemSoftwareUpdate.check() }
+        }.value
+        if showProgress { applicationCheckProgress = (0, jobs.count + 1) }
         applicationUpdateNote = "Checking \(jobs.count.formatted()) application update channels."
         var results = await withTaskGroup(of: (String, AppUpdateRecord).self) { group in
             for job in jobs { group.addTask { (job.id, await job.lookup()) } }
             var found: [String: AppUpdateRecord] = [:]
             for await (id, record) in group {
                 found[id] = record
-                if showProgress { applicationCheckProgress = (found.count, jobs.count) }
+                if showProgress { applicationCheckProgress = (found.count, jobs.count + 1) }
             }
             return found
         }
@@ -967,16 +968,30 @@ private struct WardPreferences: Codable {
                 results[id] = known
             }
         }
+        applicationUpdateNote = "Checking macOS software updates…"
+        switch await systemCheck {
+        case .success(let updates):
+            systemSoftwareUpdates = updates
+            systemUpdateCheckNote = ""
+            if let data = try? JSONEncoder().encode(updates) { UserDefaults.standard.set(data, forKey: "ward.system-software-updates.v1") }
+        case .failure(let error):
+            systemUpdateCheckNote = error.localizedDescription + " Previous results retained."
+        }
+        if showProgress { applicationCheckProgress = (jobs.count + 1, jobs.count + 1) }
+        var notificationResults = results
+        for update in systemSoftwareUpdates {
+            notificationResults[update.id] = AppUpdateRecord(text: "Available in Software Update", newer: true, canInstall: false, reported: update.version, installed: "")
+        }
         // Track delivered notifications separately from discovery/cache. A check
         // while notifications were disabled must not suppress a later alert.
         let observationKey = "ward.application-update-notifications.v2"
         var notified = UserDefaults.standard.dictionary(forKey: observationKey) as? [String: String] ?? [:]
-        let installedIDs = Set(apps.map(\.identifier))
+        let installedIDs = Set(apps.map(\.identifier)).union(systemSoftwareUpdates.map(\.id))
         notified = notified.filter { installedIDs.contains($0.key) }
-        for (id, record) in results where !record.reported.isEmpty && !record.newer { notified.removeValue(forKey: id) }
-        let pending = AppUpdateAlerts.pending(results, notified: notified)
+        for (id, record) in notificationResults where !record.reported.isEmpty && !record.newer { notified.removeValue(forKey: id) }
+        let pending = AppUpdateAlerts.pending(notificationResults, notified: notified)
         if preferences.applicationNotifications, !pending.isEmpty,
-           await deliverSystemNotification(title: "New application updates",
+           await deliverSystemNotification(title: "Updates available",
                 body: "\(pending.count.formatted()) updates available. Open Applications for details.") {
             for (id, record) in pending { notified[id] = record.reported }
         }
@@ -984,7 +999,7 @@ private struct WardPreferences: Codable {
         appUpdateChecks.merge(results) { _, new in new }
         AppUpdateStore.save(appUpdateChecks)
         updateAppBadge(appUpdateChecks, for: Set(apps.map(\.identifier)))
-        let available = results.values.filter(\.newer).count
+        let available = results.values.filter(\.newer).count + systemSoftwareUpdates.count
         applicationUpdateNote = "Checked \(jobs.count.formatted()) channels · \(available.formatted()) updates available."
         if showProgress, ContinuousClock.now < minimumEnd { try? await ContinuousClock().sleep(until: minimumEnd) }
     }
@@ -1481,7 +1496,7 @@ private struct WardMainWindow: View {
         }
         let count = model.availableAppUpdateIDs.filter { id in
             model.appUpdateChecks[id].map { currentlyNeedsAppUpdate(id, record: $0) } == true
-        }.count
+        }.count + model.systemSoftwareUpdates.count
         let image = NSImage(size: NSSize(width: 22, height: 20), flipped: false) { _ in
             NSImage(systemSymbolName: "shield", accessibilityDescription: nil)?
                 .draw(in: NSRect(x: 1, y: 1, width: 16, height: 18))
@@ -1600,7 +1615,7 @@ private struct WardSettingsPage: View {
                     }
                 }
                 section("Notifications", symbol: "bell") {
-                    Toggle("New application updates", isOn: $model.preferences.applicationNotifications)
+                    Toggle("Application and system updates", isOn: $model.preferences.applicationNotifications)
                     Toggle("New security findings", isOn: $model.preferences.findingNotifications)
                     Text("Applies to manual and scheduled checks.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -1844,7 +1859,7 @@ struct Dashboard: View {
         let apps = localReport?.inventory.applications ?? []
         let matching = apps.filter { updates.contains($0.identifier) || localReport?.appFindings(for: $0).isEmpty == false }
         let extra = updates.subtracting(apps.map(\.identifier))
-        let count = matching.count + extra.count
+        let count = matching.count + extra.union(model.systemSoftwareUpdates.map(\.id)).count
         return count > 0 ? count : nil
     }
 
@@ -4334,6 +4349,59 @@ private func currentlyNeedsAppUpdate(_ id: String, record: AppUpdateRecord) -> B
     return version == record.installed
 }
 
+private struct SystemSoftwareUpdate: Codable, Identifiable, Equatable {
+    let label: String
+    let title: String
+    let version: String
+    var id: String { "system-software:" + label }
+    static func parse(_ output: String) throws -> [Self] {
+        var label: String?
+        var updates: [Self] = []
+        for raw in output.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("* Label:") { label = String(line.dropFirst(8)).trimmingCharacters(in: .whitespaces) }
+            else if let current = label, line.hasPrefix("Title: "),
+                    let split = line.range(of: ", Version: ") {
+                let title = String(line[line.index(line.startIndex, offsetBy: 7)..<split.lowerBound])
+                let version = String(line[split.upperBound...].prefix { $0 != "," }).trimmingCharacters(in: .whitespaces)
+                guard !title.isEmpty, !version.isEmpty else { throw WardError("Incomplete system update response.") }
+                updates.append(Self(label: current, title: title, version: version))
+                label = nil
+            }
+        }
+        guard label == nil, !updates.isEmpty || output.contains("No new software available") else {
+            throw WardError("System update availability could not be determined.")
+        }
+        return updates
+    }
+    static func check() throws -> [Self] {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        defer { try? FileManager.default.removeItem(at: file) }
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/softwareupdate")
+        process.arguments = ["--list"]
+        process.environment = ProcessInfo.processInfo.environment.merging(["LC_ALL": "C", "LANG": "en_US.UTF-8"]) { _, new in new }
+        process.standardOutput = handle; process.standardError = handle
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        let deadline = Date().addingTimeInterval(120)
+        while process.isRunning {
+            if Date() >= deadline { process.terminate(); throw WardError("System update check timed out. Try again.") }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        guard process.terminationStatus == 0 else { throw WardError("System update check failed. Try again.") }
+        guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 1 << 20 else { throw WardError("System update response is too large.") }
+        return try parse(String(decoding: Data(contentsOf: file), as: UTF8.self))
+    }
+    static func load() -> [Self] {
+        guard let data = UserDefaults.standard.data(forKey: "ward.system-software-updates.v1") else { return [] }
+        return (try? JSONDecoder().decode([Self].self, from: data)) ?? []
+    }
+}
+
 private enum AppUpdateAlerts {
     static func pending(_ results: [String: AppUpdateRecord], notified: [String: String]) -> [String: AppUpdateRecord] {
         results.filter { $0.value.newer && !$0.value.reported.isEmpty && notified[$0.key] != $0.value.reported }
@@ -6532,12 +6600,30 @@ struct ReportView: View {
             searchField("Search applications", text: $appQuery)
             filterChips(AppFilter.allCases.filter { device.id == "local" || $0 != .updates }, selection: Binding(get: { appFilter }, set: { selectedAppFilter = $0 })) { filter in
                 switch filter {
-                case .updates: return filter.rawValue + "  " + listedApplications.count { updateChecks[$0.identifier]?.newer == true }.formatted()
+                case .updates: return filter.rawValue + "  " + (listedApplications.count { updateChecks[$0.identifier]?.newer == true } + (device.id == "local" ? model.systemSoftwareUpdates.count : 0)).formatted()
                 case .flagged: return filter.rawValue + "  " + listedApplications.count { !report.appFindings(for: $0).isEmpty }.formatted()
                 default: return filter.rawValue
                 }
             }
-            if filteredApplications.isEmpty {
+            if device.id == "local", appFilter == .updates || appFilter == .apple {
+                if !model.systemUpdateCheckNote.isEmpty {
+                    Label(model.systemUpdateCheckNote, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
+                }
+                ForEach(model.systemSoftwareUpdates.filter { appQuery.isEmpty || $0.title.localizedCaseInsensitiveContains(appQuery) }) { update in
+                    HStack(spacing: 14) {
+                        Image(systemName: "gearshape.arrow.triangle.2.circlepath").font(.title2).foregroundStyle(.blue)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(update.title).font(.headline)
+                            Text("Version " + update.version + " · macOS Software Update").font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Open Software Update") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension") { NSWorkspace.shared.open(url) }
+                        }.wardGlassButton()
+                    }.padding(16).wardGlass(radius: 18)
+                }
+            }
+            if filteredApplications.isEmpty && !(device.id == "local" && (appFilter == .updates || appFilter == .apple) && !model.systemSoftwareUpdates.isEmpty) {
                 Text(listedApplications.isEmpty
                      ? "This report has no application bundles."
                      : (appFilter == .updates
