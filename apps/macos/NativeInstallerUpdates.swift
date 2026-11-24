@@ -111,17 +111,10 @@ enum NativeInstallerUpdates {
     }
     private static func range(_ url: URL, start: Int, length: Int) async throws -> Data {
         guard start >= 0, length > 0, length <= 1_048_576 else { throw URLError(.dataLengthExceedsMaximum) }
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        request.setValue("bytes=\(start)-\(start + length - 1)", forHTTPHeaderField: "Range")
-        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-        let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-        let (stream, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 206,
-              response.url?.scheme == "https", http.value(forHTTPHeaderField: "Content-Range")?.hasPrefix("bytes \(start)-\(start+length-1)/") == true else { throw URLError(.badServerResponse) }
-        var data = Data()
-        for try await byte in stream { guard data.count < length else { throw URLError(.dataLengthExceedsMaximum) }; data.append(byte) }
-        guard data.count == length else { throw URLError(.badServerResponse) }
+        let (data, http) = try await MetadataBackend.shared.fetch(url, range: "bytes=\(start)-\(start + length - 1)", maxBytes: length)
+        guard http.statusCode == 206,
+              http.value(forHTTPHeaderField: "Content-Range")?.hasPrefix("bytes \(start)-\(start+length-1)/") == true,
+              data.count == length else { throw URLError(.badServerResponse) }
         return data
     }
     static func version(_ urls: [URL], id: String) async throws -> String {

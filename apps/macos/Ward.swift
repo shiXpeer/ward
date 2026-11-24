@@ -782,6 +782,7 @@ private struct WardPreferences: Codable {
            let saved = try? JSONDecoder().decode([Beacon].self, from: raw) { beacons = saved }
         if let raw = UserDefaults.standard.string(forKey: "activeBeacon"), let id = UUID(uuidString: raw),
            beacons.contains(where: { $0.id == id }) { activeFeed = id }
+        configureOfficialBeacon()
         let local = root.appendingPathComponent("local/report.json")
         if let raw = try? Data(contentsOf: local), let report = try? Wire.decode(raw) {
             devices.append(Device(id: "local", name: "This Mac", report: report))
@@ -808,6 +809,28 @@ private struct WardPreferences: Codable {
         watchInstalledVersions()
         Task { [weak self] in self?.startLaunchChecks() }
     }
+    private func configureOfficialBeacon() {
+        guard let key = Bundle.main.url(forResource: "OfficialFeed", withExtension: "pub") else { return }
+        let id = OfficialWardBackend.beaconID
+        var configured = beacons
+        if let index = configured.firstIndex(where: { $0.id == id }) {
+            configured[index].feed = OfficialWardBackend.origin.absoluteString
+            configured[index].feedKey = key.path
+            configured[index].caFile = ""
+        } else {
+            configured.insert(Beacon(id: id, name: "Ward", feed: OfficialWardBackend.origin.absoluteString,
+                feedKey: key.path, caFile: "", relay: ""), at: 0)
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try JSONEncoder().encode(configured).write(to: root.appendingPathComponent("beacons.json"), options: .atomic)
+            beacons = configured
+            let migration = "ward.official-source-default.v1"
+            if activeFeed == nil || !UserDefaults.standard.bool(forKey: migration) { activeFeed = id }
+            UserDefaults.standard.set(true, forKey: migration)
+        } catch { message = "Could not configure the Ward database source: " + error.localizedDescription }
+    }
+
     func add(_ beacon: Beacon, token: String) throws {
         _ = try Wire.origin(beacon.feed)
         if !beacon.relay.isEmpty {
@@ -1478,7 +1501,10 @@ private struct WardPreferences: Codable {
             process.executableURL = URL(fileURLWithPath: action.executable)
             process.arguments = arguments
             process.currentDirectoryURL = URL(fileURLWithPath: "/")
+            guard let curl = Bundle.main.url(forResource: "BrewCurl", withExtension: "sh") else { throw WardError("Bundled Homebrew metadata transport missing. Rebuild Ward.") }
             let env = [
+                "HOMEBREW_CURL_PATH": curl.path,
+                "HOMEBREW_API_DOMAIN": OfficialWardBackend.origin.appendingPathComponent("v1/homebrew").absoluteString,
                 "HOMEBREW_NO_AUTO_UPDATE": "1",
                 "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
                 "PATH": brewBin + ":/usr/bin:/bin:/usr/sbin:/sbin",
@@ -5136,6 +5162,23 @@ private struct VendorPackage {
     let version: String
     let url: URL?
     let size: Int?
+    var checksumURL: URL? = nil
+    var sha512: String? = nil
+}
+
+private func verifyArchiveChecksum(_ file: URL, sha256: String? = nil, sha512: String? = nil) throws {
+    guard sha256 != nil || sha512 != nil else { return }
+    if let sha256, sha256.range(of: "^[A-Fa-f0-9]{64}$", options: .regularExpression) == nil { throw WardError("Invalid SHA-256 metadata.") }
+    if let sha512, Data(base64Encoded: sha512)?.count != 64 { throw WardError("Invalid SHA-512 metadata.") }
+    let handle = try FileHandle(forReadingFrom: file)
+    defer { try? handle.close() }
+    var hash256 = SHA256(); var hash512 = SHA512()
+    while let block = try handle.read(upToCount: 1 << 20), !block.isEmpty {
+        if sha256 != nil { hash256.update(data: block) }
+        if sha512 != nil { hash512.update(data: block) }
+    }
+    if let sha256, hash256.finalize().map({ String(format: "%02x", $0) }).joined() != sha256.lowercased() { throw WardError("Archive SHA-256 mismatch. Installation stopped.") }
+    if let sha512, Data(hash512.finalize()).base64EncodedString() != sha512 { throw WardError("Archive SHA-512 mismatch. Installation stopped.") }
 }
 
 private func installableVendorURL(_ raw: String) -> URL? {
@@ -5148,7 +5191,7 @@ private func jetBrainsPackage(_ code: String) async throws -> VendorPackage {
     var parts = URLComponents(string: "https://data.services.jetbrains.com/products/releases")!
     parts.queryItems = [URLQueryItem(name: "code", value: code), URLQueryItem(name: "type", value: "release"),
                         URLQueryItem(name: "latest", value: "true")]
-    struct Download: Decodable { let link: String; let size: Int }
+    struct Download: Decodable { let link: String; let size: Int; let checksumLink: String? }
     struct Release: Decodable { let version, type: String; let downloads: [String: Download] }
     let releases = try JSONDecoder().decode([String: [Release]].self, from: await fetchHTTPS(parts.url!))
     let stable = (releases[code] ?? []).filter { $0.type == "release" }
@@ -5160,7 +5203,9 @@ private func jetBrainsPackage(_ code: String) async throws -> VendorPackage {
           archive.size <= AppUpdateStore.maxVendorArchive, let url = installableVendorURL(archive.link) else {
         return VendorPackage(version: version, url: nil, size: nil)
     }
-    return VendorPackage(version: version, url: url, size: archive.size)
+    let checksumURL = archive.checksumLink.flatMap(httpsUpdateURL)
+    if archive.checksumLink != nil && checksumURL == nil { throw URLError(.badServerResponse) }
+    return VendorPackage(version: version, url: url, size: archive.size, checksumURL: checksumURL)
 }
 
 private func electronPackage(_ base: URL) async throws -> VendorPackage {
@@ -5174,7 +5219,7 @@ private func electronPackageMetadata(_ data: Data, feed: URL) throws -> VendorPa
     for raw in text.split(separator: "\n") where !raw.hasPrefix(" ") && !raw.hasPrefix("\t") {
         guard let colon = raw.firstIndex(of: ":") else { continue }
         let key = String(raw[..<colon])
-        guard ["version", "path"].contains(key), fields[key] == nil else { continue }
+        guard ["version", "path", "sha512"].contains(key), fields[key] == nil else { continue }
         var value = raw[raw.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         if value.count >= 2 && ((value.hasPrefix("\"") && value.hasSuffix("\"")) ||
                                (value.hasPrefix("'") && value.hasSuffix("'"))) {
@@ -5184,7 +5229,8 @@ private func electronPackageMetadata(_ data: Data, feed: URL) throws -> VendorPa
     }
     guard let version = fields["version"], versionOrder(version, version) != nil else { throw URLError(.badServerResponse) }
     let url = fields["path"].flatMap { resolveFeedURL($0, relativeTo: feed) }.flatMap { installableVendorURL($0.absoluteString) }
-    return VendorPackage(version: version, url: url, size: nil)
+    if let checksum = fields["sha512"], Data(base64Encoded: checksum)?.count != 64 { throw URLError(.badServerResponse) }
+    return VendorPackage(version: version, url: url, size: nil, sha512: fields["sha512"])
 }
 
 private func verifyDeveloperUpdate(_ app: URL, bundleID: String, team: String) throws {
@@ -5262,42 +5308,17 @@ private struct AppUpdateJob: Sendable {
     }
 
     private static func dockerDesktopVersion(_ executable: URL) async throws -> String {
-        try await Task.detached {
-            var code: SecStaticCode?
-            var requirement: SecRequirement?
-            let expression = "anchor apple generic and identifier \"docker-desktop\" and certificate leaf[subject.OU] = \"9BNSXJN65R\""
-            guard SecStaticCodeCreateWithPath(executable as CFURL, [], &code) == errSecSuccess,
-                  SecRequirementCreateWithString(expression as CFString, [], &requirement) == errSecSuccess,
-                  let code, let requirement,
-                  SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess else {
-                throw WardError("Docker Desktop update checker signature could not be verified.")
-            }
-            let process = Process()
-            let output = Pipe()
-            process.executableURL = executable
-            process.arguments = ["desktop", "update", "--check-only"]
-            process.standardInput = FileHandle.nullDevice
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            output.fileHandleForWriting.closeFile()
-            let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: timeout)
-            defer { timeout.cancel() }
-            let data = output.fileHandleForReading.readData(ofLength: 4097)
-            if data.count > 4096, process.isRunning { process.terminate() }
-            process.waitUntilExit()
-            guard data.count <= 4096, process.terminationStatus == 0 else { throw URLError(.badServerResponse) }
-            let text = String(decoding: data, as: UTF8.self)
-            let pattern = #"^Docker Desktop ([0-9]+\.[0-9]+\.[0-9]+) is (?:available:?|already the latest version)$"#
-            for line in text.split(whereSeparator: \.isNewline) {
-                let value = String(line).trimmingCharacters(in: .whitespaces)
-                if let range = value.range(of: pattern, options: .regularExpression) {
-                    return value[range].split(separator: " ")[2].description
-                }
-            }
-            throw URLError(.badServerResponse)
-        }.value
+        let arch = currentCPU() == "arm64" ? "arm64" : "amd64"
+        let url = URL(string: "https://desktop.docker.com/mac/main/" + arch + "/appcast.json")!
+        struct Feed: Decodable {
+            struct Item: Decodable { let AppVersion: String; let Visibility: String? }
+            let Items: [Item]
+        }
+        let feed = try JSONDecoder().decode(Feed.self, from: await fetchHTTPS(url))
+        guard let version = newestComparable(feed.Items.filter { ($0.Visibility.flatMap(Double.init) ?? 0) > 0 }.map(\.AppVersion)) else {
+            throw WardError("No published stable Docker Desktop version.")
+        }
+        return version
     }
 
     private static func record(channel: String, installed: String, reported: String, canInstall: Bool) -> AppUpdateRecord {
@@ -5347,7 +5368,7 @@ private struct AppUpdateJob: Sendable {
         if status == 204 {
             return record(channel: "its updater", installed: installed, reported: installed, canInstall: false)
         }
-        struct Payload: Decodable { let url, name: String }
+        struct Payload: Decodable { let url, name: String; let sha256hash: String? }
         let payload = try JSONDecoder().decode(Payload.self, from: data)
         let archive = httpsUpdateURL(payload.url)
         let zip = archive?.path.lowercased().hasSuffix(".zip") == true
@@ -5461,35 +5482,15 @@ private func httpsUpdateURL(_ string: String) -> URL? {
 }
 
 private func fetchHTTPS(_ url: URL) async throws -> Data {
-    var request = URLRequest(url: url, timeoutInterval: 20)
-    request.setValue("shixpeer-ward", forHTTPHeaderField: "User-Agent")
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.timeoutIntervalForRequest = 20
-    configuration.waitsForConnectivity = false
-    let session = URLSession(configuration: configuration)
-    defer { session.finishTasksAndInvalidate() }
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse,
-          (200..<300).contains(http.statusCode),
-          response.url?.scheme?.lowercased() == "https",
-          data.count <= 512_000 else { throw URLError(.badServerResponse) }
+    let (data, response) = try await MetadataBackend.shared.fetch(url)
+    guard response.statusCode == 200 else { throw URLError(.badServerResponse) }
     return data
 }
 
 private func fetchHTTPSStatus(_ url: URL) async throws -> (data: Data, status: Int) {
-    var request = URLRequest(url: url, timeoutInterval: 20)
-    request.setValue("shixpeer-ward", forHTTPHeaderField: "User-Agent")
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.timeoutIntervalForRequest = 20
-    configuration.waitsForConnectivity = false
-    let session = URLSession(configuration: configuration)
-    defer { session.finishTasksAndInvalidate() }
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse,
-          http.statusCode == 200 || http.statusCode == 204,
-          response.url?.scheme?.lowercased() == "https",
-          data.count <= 512_000 else { throw URLError(.badServerResponse) }
-    return (data, http.statusCode)
+    let (data, response) = try await MetadataBackend.shared.fetch(url)
+    guard response.statusCode == 200 || response.statusCode == 204 else { throw URLError(.badServerResponse) }
+    return (data, response.statusCode)
 }
 
 private func vscodeCheckURL(base: URL, platform: String, name: String, quality: String, installed: String) -> URL? {
@@ -7697,7 +7698,7 @@ struct ReportView: View {
         log("Reading the update address written in \(request.name).")
         let (data, status) = try await fetchHTTPSStatus(check)
         guard status == 200 else { throw WardError("The updater has nothing newer.") }
-        struct Payload: Decodable { let url, name: String }
+        struct Payload: Decodable { let url, name: String; let sha256hash: String? }
         let payload = try JSONDecoder().decode(Payload.self, from: data)
         guard payload.name == request.toVersion, let archive = httpsUpdateURL(payload.url), archive.path.lowercased().hasSuffix(".zip") else {
             throw WardError("The updater changed. Check versions again before updating.")
@@ -7705,6 +7706,10 @@ struct ReportView: View {
         log("Downloading \(archive.lastPathComponent).")
         let zip = try await downloadHTTPS(archive, maxBytes: AppUpdateStore.maxDeveloperZip, progress: { received, total in installationDownloadProgress(received, total) })
         defer { try? FileManager.default.removeItem(at: zip) }
+        if let checksum = payload.sha256hash {
+            log("Verifying archive checksum…")
+            try await Task.detached { try verifyArchiveChecksum(zip, sha256: checksum) }.value
+        }
         log("Unpacking the archive.")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("shixpeer-ward-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -7753,6 +7758,15 @@ struct ReportView: View {
             guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize) == size else {
                 throw WardError("The archive size differs from its feed.")
             }
+        }
+        if package.checksumURL != nil || package.sha512 != nil {
+            log("Verifying archive checksum…")
+            let checksum256: String?
+            if let checksumURL = package.checksumURL {
+                checksum256 = String(decoding: try await fetchHTTPS(checksumURL), as: UTF8.self).split(whereSeparator: \.isWhitespace).first.map(String.init)
+                guard checksum256 != nil else { throw WardError("Empty archive checksum metadata.") }
+            } else { checksum256 = nil }
+            try await Task.detached { try verifyArchiveChecksum(file, sha256: checksum256, sha512: package.sha512) }.value
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("shixpeer-ward-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

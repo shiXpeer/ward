@@ -7,7 +7,7 @@ sed 's/@main struct WardApp: App/struct WardApp: App/' apps/macos/Ward.swift > "
 # Append in the same file to exercise the production private update record policy.
 cat apps/macos/AppUpdatesTests.swift >> "$tmp/Ward.swift"
 swiftc -parse-as-library -target "$(uname -m)-apple-macos14.0" "$tmp/Ward.swift" \
-    apps/macos/ServerReports.swift apps/macos/ServerEnrollment.swift apps/macos/NativeInstallerUpdates.swift -o "$tmp/app-tests"
+    apps/macos/ServerReports.swift apps/macos/ServerEnrollment.swift apps/macos/NativeInstallerUpdates.swift apps/macos/MetadataBackend.swift -o "$tmp/app-tests"
 fixture="$tmp/Lifecycle Fixture.app"
 mkdir -p "$fixture/Contents/MacOS"
 cat > "$tmp/LifecycleFixture.swift" <<'SWIFT'

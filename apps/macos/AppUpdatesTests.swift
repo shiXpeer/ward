@@ -19,6 +19,16 @@ import zlib
         return data
     }
     @MainActor static func main() async throws {
+        let sourceURL = URL(string: "https://updates.example/latest?channel=stable")!
+        let metadata = try OfficialWardBackend.metadataRequest(sourceURL, range: "bytes=0-27")
+        precondition(metadata.url?.host == "ward.shixpeer.com" && metadata.httpMethod == "POST")
+        let requestBody = try JSONSerialization.jsonObject(with: metadata.httpBody!) as! [String: String]
+        precondition(requestBody["url"] == sourceURL.absoluteString && requestBody["range"] == "bytes=0-27")
+        precondition(metadata.value(forHTTPHeaderField: "Authorization") == nil && metadata.value(forHTTPHeaderField: "Cookie") == nil)
+        for value in ["http://updates.example/latest", "https://user:secret@updates.example/latest", "https://updates.example/latest#fragment"] {
+            do { _ = try OfficialWardBackend.metadataRequest(URL(string: value)!); fatalError("Invalid metadata destination") } catch {}
+        }
+        print("PASS: version metadata routes to the Ward backend without forwarding credentials")
         let launch = LaunchChecks()
         var order: [LaunchChecks.Step] = []
         await launch.run(enabled: false, ready: { true }, perform: { order.append($0) })
@@ -165,6 +175,18 @@ import zlib
         let closedAgain = try await AppUpdateLifecycle.waitForExit([reopened.processIdentifier], timeout: .seconds(10))
         precondition(closedAgain)
         print("PASS: real isolated app quit and reopen at its original bundle path")
+        let archiveFixture = root.appendingPathComponent("archive-checksum")
+        let archiveBytes = Data("signed-package-fixture".utf8)
+        try archiveBytes.write(to: archiveFixture)
+        let sha256 = SHA256.hash(data: archiveBytes).map { String(format: "%02x", $0) }.joined()
+        let sha512 = Data(SHA512.hash(data: archiveBytes)).base64EncodedString()
+        try verifyArchiveChecksum(archiveFixture, sha256: sha256, sha512: sha512)
+        do { try verifyArchiveChecksum(archiveFixture, sha256: String(repeating: "0", count: 64)); fatalError("Checksum mismatch accepted") } catch {}
+        do { try verifyArchiveChecksum(archiveFixture, sha512: "invalid"); fatalError("Invalid checksum accepted") } catch {}
+        let yaml = "version: 2.0\npath: Fixture.zip\nsha512: " + sha512 + "\n"
+        let package = try electronPackageMetadata(Data(yaml.utf8), feed: URL(string: "https://updates.example/latest.yml")!)
+        precondition(package.sha512 == sha512 && package.url?.host == "updates.example")
+        print("PASS: archive SHA-256/SHA-512 validation remains local and rejects mismatches")
         let executable = root.appendingPathComponent("Fixture")
         let mapping = #"const links={macos:"https://updates.example/app-intel.pkg",macos_m1:"https://updates.example/app-arm.pkg"}"#
         var binary = Data(repeating: 0, count: 1024 * 1024 - 20)
