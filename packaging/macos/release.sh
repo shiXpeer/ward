@@ -11,6 +11,8 @@ arch="${3:-arm64}"
 [[ "$arch" == arm64 || "$arch" == x86_64 ]] || exit 1
 [[ "$WARD_SIGN_IDENTITY" == 'Developer ID Application:'* ]] || { echo 'Developer ID Application is required' >&2; exit 1; }
 security find-identity -v -p codesigning | grep -F -- "\"$WARD_SIGN_IDENTITY\"" >/dev/null || { echo 'Signing identity with private key not found' >&2; exit 1; }
+# Fail before compiling if the local notarization profile is missing or invalid.
+xcrun notarytool history --keychain-profile "$WARD_NOTARY_PROFILE" >/dev/null
 export WARD_VERSION="$version" WARD_BUILD="$build" WARD_ARCH="$arch" WARD_SPARKLE=1
 bash apps/macos/build.sh
 app="$PWD/dist/macos/Shixpeer Ward.app"
