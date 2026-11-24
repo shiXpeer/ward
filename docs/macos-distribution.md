@@ -68,3 +68,13 @@ Test an older notarized build against a newer signed release: quit/install/relau
 must succeed and preserve local reports/settings. A corrupt archive must fail.
 End-to-end notarization/update validation requires the distribution certificate
 and two real signed release builds; fixture tests alone do not establish this.
+
+## Automatic Ward update offers
+
+The app probes its Sparkle feed shortly after launch (after first-run setup), then
+once every six hours while running. Probing does not install or open modal update
+windows. A valid update produces a persistent in-app offer. With application
+notifications enabled and macOS permission granted, Ward sends one actionable
+notification per build; failed/denied notification delivery is not marked as sent.
+The notification and in-app Update Ward button start Sparkle's interactive update
+flow. Generic application notifications exclude Ward to avoid duplicate alerts.

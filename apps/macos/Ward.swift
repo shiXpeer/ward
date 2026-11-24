@@ -559,7 +559,7 @@ private struct WardPreferences: Codable {
                     self.updateAppBadge(self.appUpdateChecks, for: Set(apps.map(\.identifier)))
                     let key = "ward.application-update-notifications.v2"
                     var notified = UserDefaults.standard.dictionary(forKey: key) as? [String:String] ?? [:]
-                    let pending = AppUpdateAlerts.pending(refreshed, notified: notified)
+                    let pending = AppUpdateAlerts.pending(refreshed.filter { $0.key != Bundle.main.bundleIdentifier }, notified: notified)
                     if self.preferences.applicationNotifications, !pending.isEmpty,
                        await self.deliverSystemNotification(title: "Updates available", body: "\(pending.count) updates available. Open Applications for details.") {
                         for (id, record) in pending { notified[id] = record.reported }
@@ -1274,7 +1274,7 @@ private struct WardPreferences: Codable {
         let installedIDs = Set(apps.map(\.identifier)).union(systemSoftwareUpdates.map(\.id))
         notified = notified.filter { installedIDs.contains($0.key) }
         for (id, record) in notificationResults where !record.reported.isEmpty && !record.newer { notified.removeValue(forKey: id) }
-        let pending = AppUpdateAlerts.pending(notificationResults, notified: notified)
+        let pending = AppUpdateAlerts.pending(notificationResults.filter { $0.key != Bundle.main.bundleIdentifier }, notified: notified)
         if preferences.applicationNotifications, !pending.isEmpty,
            await deliverSystemNotification(title: "Updates available",
                 body: "\(pending.count.formatted()) updates available. Open Applications for details.") {
@@ -1661,12 +1661,53 @@ private struct WardPreferences: Codable {
     }
 }
 
-@MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+@MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, ObservableObject {
     private var statusMenu: WardStatusMenu?
     private weak var model: WardModel?
+    @Published private(set) var availableWardVersion: String?
     private var explicitlyQuitting = false
 #if canImport(Sparkle)
     private var wardUpdater: SPUStandardUpdaterController?
+    private var wardUpdateSchedule: Task<Void, Never>?
+    private func scheduleWardUpdates() {
+        wardUpdateSchedule?.cancel()
+        wardUpdateSchedule = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            while !Task.isCancelled {
+                guard let self else { return }
+                let ready = UserDefaults.standard.bool(forKey: "ward.welcome.completed.v1")
+                if ready { self.wardUpdater?.updater.checkForUpdateInformation() }
+                do { try await Task.sleep(for: .seconds(ready ? 21600 : 10)) } catch { return }
+            }
+        }
+    }
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        availableWardVersion = item.displayVersionString
+        let build = item.versionString
+        Task {
+            guard model?.preferences.applicationNotifications ?? WardPreferences.load().applicationNotifications,
+                  UserDefaults.standard.string(forKey: "ward.self-update.notified-build") != build else { return }
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return }
+            let action = UNNotificationAction(identifier: "ward.self-update.install", title: "Update Ward", options: [.foreground])
+            let category = UNNotificationCategory(identifier: "ward.self-update", actions: [action], intentIdentifiers: [])
+            var categories = await center.notificationCategories(); categories.insert(category)
+            center.setNotificationCategories(categories)
+            let content = UNMutableNotificationContent()
+            content.title = "Ward update available"
+            content.body = "Ward \(item.displayVersionString) is ready. Open to update and restart."
+            content.sound = .default; content.categoryIdentifier = "ward.self-update"
+            do {
+                try await center.add(UNNotificationRequest(identifier: "ward.self-update", content: content, trigger: nil))
+                UserDefaults.standard.set(build, forKey: "ward.self-update.notified-build")
+            } catch { /* The in-app update offer remains available. */ }
+        }
+    }
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        availableWardVersion = nil
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["ward.self-update"])
+    }
     func checkWardUpdates() { wardUpdater?.checkForUpdates(nil) }
     func updaterWillRelaunchApplication(_ updater: SPUUpdater) { explicitlyQuitting = true }
 #endif
@@ -1714,10 +1755,26 @@ private struct WardPreferences: Codable {
         [.banner, .list, .sound]
     }
 
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                           didReceive response: UNNotificationResponse) async {
+        guard response.notification.request.identifier == "ward.self-update",
+              response.actionIdentifier != UNNotificationDismissActionIdentifier else { return }
+        await MainActor.run {
+            NSApp.activate(ignoringOtherApps: true)
+            self.statusMenu?.reopen()
+#if canImport(Sparkle)
+            self.checkWardUpdates()
+#endif
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
 #if canImport(Sparkle)
         wardUpdater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
+        // Own the schedule so checks probe quietly; installation always needs a user action.
+        wardUpdater?.updater.automaticallyChecksForUpdates = false
+        scheduleWardUpdates()
 #endif
         if let url = Bundle.main.url(forResource: "WardMatte", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
@@ -1753,13 +1810,29 @@ extension WardAppDelegate: SPUUpdaterDelegate {}
 
 private struct WardMainWindow: View {
     @ObservedObject var model: WardModel
-    let appDelegate: WardAppDelegate
+    @ObservedObject var appDelegate: WardAppDelegate
     @Environment(\.openWindow) private var openWindow
     @AppStorage("ward.welcome.completed.v1") private var welcomeCompleted = false
     @State private var showingWelcome = false
 
     var body: some View {
         Dashboard(model: model)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let version = appDelegate.availableWardVersion {
+                    HStack(spacing: 14) {
+                        Image(systemName: "arrow.down.circle.fill").foregroundStyle(.mint)
+                        Text("Ward \(version) is available").font(.callout.weight(.semibold))
+                        Spacer()
+                        Button("Update Ward") {
+#if canImport(Sparkle)
+                            appDelegate.checkWardUpdates()
+#endif
+                        }.wardGlassButton(prominent: true)
+                    }
+                    .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .padding(.horizontal, 24).padding(.top, 12)
+                }
+            }
             .sheet(isPresented: $showingWelcome) {
                 WardWelcome(model: model) {
                     welcomeCompleted = true
