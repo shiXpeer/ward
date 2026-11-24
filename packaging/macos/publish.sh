@@ -16,5 +16,6 @@ dist/sparkle-2.10.1/bin/sign_update --account com.shixpeer.ward --verify "$dmg" 
 if ! gh release view "v$version" --repo shiXpeer/ward >/dev/null 2>&1; then
   gh release create "v$version" --repo shiXpeer/ward --draft --title "Ward $version" --notes "macOS $version"
 fi
-gh release upload "v$version" "$dmg" "$out/SHA256SUMS#SHA256SUMS-$arch" --repo shiXpeer/ward
+cp "$out/SHA256SUMS" "$out/SHA256SUMS-$arch"
+gh release upload "v$version" "$dmg" "$out/SHA256SUMS-$arch" --repo shiXpeer/ward
 echo 'Uploaded to GitHub draft. Publish the release, then deploy its appcast using docs/macos-distribution.md.'
