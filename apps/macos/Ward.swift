@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreServices
 import Combine
 import CryptoKit
 import Security
@@ -1438,12 +1439,17 @@ private struct WardPreferences: Codable {
 
 @MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusMenu: WardStatusMenu?
+    private weak var model: WardModel?
+    private var explicitlyQuitting = false
+    static weak var current: WardAppDelegate?
     override init() {
         super.init()
+        Self.current = self
         UNUserNotificationCenter.current().delegate = self
     }
 
     func connectStatusMenu(to model: WardModel, openPage: @escaping (String) -> Void) {
+        self.model = model
         if let statusMenu {
             statusMenu.openPage = openPage
         } else {
@@ -1452,6 +1458,27 @@ private struct WardPreferences: Codable {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func quitCompletely() {
+        explicitlyQuitting = true
+        model?.cancelScan()
+        NSApp.terminate(nil)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let reason = NSAppleEventManager.shared().currentAppleEvent?.paramDescriptor(forKeyword: AEKeyword(kAEQuitReason))?.enumCodeValue
+        // Never obstruct logout, shutdown, restart or an explicit Quit Ward.
+        let systemQuitReasons = [kAEQuitAll, kAEShutDown, kAERestart, kAEReallyLogOut, kAELogOut].map { OSType($0) }
+        if explicitlyQuitting || reason.map({ systemQuitReasons.contains($0) }) == true { return .terminateNow }
+        statusMenu?.enterBackground()
+        return .terminateCancel
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        guard !hasVisibleWindows, let statusMenu else { return true }
+        statusMenu.reopen()
+        return false
+    }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
@@ -1475,6 +1502,11 @@ private struct WardPreferences: Codable {
             WardMainWindow(model: model, appDelegate: appDelegate)
         }
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit Ward") { appDelegate.quitCompletely() }.keyboardShortcut("q")
+            }
+        }
     }
 }
 
@@ -1528,13 +1560,25 @@ private struct WardMainWindow: View {
     }
 
     private func scheduleDockRefresh() {
-        Task { @MainActor [weak self] in self?.refreshDockVisibility() }
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            self?.refresh()
+            self?.refreshDockVisibility()
+        }
     }
 
+    func enterBackground() {
+        for window in NSApp.windows where window.styleMask.contains(.titled) { window.orderOut(nil) }
+        refresh()
+        refreshDockVisibility()
+    }
+
+    func reopen() { show("home") }
+
     private func refreshDockVisibility() {
-        guard let model else { return }
+        guard model != nil else { return }
         let hasWindow = NSApp.windows.contains { $0.isVisible && $0.canBecomeKey && $0.styleMask.contains(.titled) }
-        let policy: NSApplication.ActivationPolicy = model.preferences.menuBar && !hasWindow ? .accessory : .regular
+        let policy: NSApplication.ActivationPolicy = !hasWindow ? .accessory : .regular
         if NSApp.activationPolicy() != policy { NSApp.setActivationPolicy(policy) }
     }
 
@@ -1550,7 +1594,8 @@ private struct WardMainWindow: View {
 
     private func refresh() {
         guard let model else { return }
-        guard model.preferences.menuBar else {
+        let hasWindow = NSApp.windows.contains { $0.isVisible && $0.canBecomeKey && $0.styleMask.contains(.titled) }
+        guard model.preferences.menuBar || !hasWindow else {
             if let item {
                 NSStatusBar.system.removeStatusItem(item)
                 self.item = nil
@@ -1629,7 +1674,7 @@ private struct WardMainWindow: View {
     }
     @objc private func openLoginItems() { show("settings"); SMAppService.openSystemSettingsLoginItems() }
     @objc private func settings() { show("settings") }
-    @objc private func quit() { model?.cancelScan(); NSApp.terminate(nil) }
+    @objc private func quit() { WardAppDelegate.current?.quitCompletely() }
 }
 
 private struct WardSettingsPage: View {
@@ -1649,7 +1694,7 @@ private struct WardSettingsPage: View {
                 Text("Settings").font(.largeTitle.weight(.semibold))
                 section("Menu bar", symbol: "menubar.rectangle") {
                     Toggle("Show Ward in the menu bar", isOn: $model.preferences.menuBar)
-                    Text("Closing the last window hides Ward from the Dock. Scheduled checks keep running.")
+                    Text("Closing the window or quitting from the Dock keeps Ward in the menu bar. Use Quit Ward to exit completely.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 section("Startup", symbol: "power") {
