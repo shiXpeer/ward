@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(Sparkle)
+import Sparkle
+#endif
 import CoreServices
 import Combine
 import CryptoKit
@@ -521,6 +524,7 @@ private struct WardPreferences: Codable {
     @Published fileprivate var notificationIssue = ""
 
     fileprivate func startLaunchChecks() {
+        guard UserDefaults.standard.bool(forKey: "ward.welcome.completed.v1") else { return }
         guard preferences.launchChecks, !launchChecks.started, launchChecksTask == nil else { return }
         runningLaunchChecks = true
         launchChecksTask = Task { [weak self] in
@@ -1581,6 +1585,11 @@ private struct WardPreferences: Codable {
     private var statusMenu: WardStatusMenu?
     private weak var model: WardModel?
     private var explicitlyQuitting = false
+#if canImport(Sparkle)
+    private var wardUpdater: SPUStandardUpdaterController?
+    func checkWardUpdates() { wardUpdater?.checkForUpdates(nil) }
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) { explicitlyQuitting = true }
+#endif
     static weak var current: WardAppDelegate?
     override init() {
         super.init()
@@ -1627,12 +1636,19 @@ private struct WardPreferences: Codable {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = self
+#if canImport(Sparkle)
+        wardUpdater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
+#endif
         if let url = Bundle.main.url(forResource: "WardMatte", withExtension: "icns"),
            let icon = NSImage(contentsOf: url) {
             NSApplication.shared.applicationIconImage = icon
         }
     }
 }
+
+#if canImport(Sparkle)
+extension WardAppDelegate: SPUUpdaterDelegate {}
+#endif
 
 @main struct WardApp: App {
     @NSApplicationDelegateAdaptor(WardAppDelegate.self) private var appDelegate
@@ -1643,6 +1659,11 @@ private struct WardPreferences: Codable {
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
+            #if canImport(Sparkle)
+            CommandGroup(after: .appInfo) {
+                Button("Check for Ward Updates…") { appDelegate.checkWardUpdates() }
+            }
+#endif
             CommandGroup(replacing: .appTermination) {
                 Button("Quit Ward") { appDelegate.quitCompletely() }.keyboardShortcut("q")
             }
@@ -1654,11 +1675,21 @@ private struct WardMainWindow: View {
     @ObservedObject var model: WardModel
     let appDelegate: WardAppDelegate
     @Environment(\.openWindow) private var openWindow
+    @AppStorage("ward.welcome.completed.v1") private var welcomeCompleted = false
+    @State private var showingWelcome = false
 
     var body: some View {
         Dashboard(model: model)
+            .sheet(isPresented: $showingWelcome) {
+                WardWelcome(model: model) {
+                    welcomeCompleted = true
+                    showingWelcome = false
+                    model.startLaunchChecks()
+                }.interactiveDismissDisabled()
+            }
             .environmentObject(model)
             .frame(minWidth: 820, minHeight: 540)
+            .task { showingWelcome = !welcomeCompleted }
             .focusEffectDisabled()
             .onAppear {
                 model.startLaunchChecks()
@@ -1673,6 +1704,50 @@ private struct WardMainWindow: View {
                     NSApp.activate(ignoringOtherApps: true)
                 }
             }
+    }
+}
+
+private struct WardWelcome: View {
+    @ObservedObject var model: WardModel
+    let done: () -> Void
+    @State private var notificationState = "Optional"
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Welcome to Ward").font(.largeTitle.bold())
+                Text("Your Mac, checked. The signed database is already connected.")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading).padding(24)
+            .background(LinearGradient(colors: [.indigo.opacity(0.35), .cyan.opacity(0.15)], startPoint: .leading, endPoint: .trailing), in: RoundedRectangle(cornerRadius: 22))
+            HStack {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Notifications").font(.headline)
+                    Text("New application updates and security findings.").foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(notificationState == "Allowed" ? "Allowed" : "Allow…") {
+                    Task {
+                        do {
+                            let allowed = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                            notificationState = allowed ? "Allowed" : "Off"
+                            if allowed { model.preferences.applicationNotifications = true; model.preferences.findingNotifications = true }
+                        } catch { notificationState = "Off" }
+                    }
+                }.disabled(notificationState == "Allowed")
+            }
+            Toggle("Launch Ward at login", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
+            if model.loginStatus == .requiresApproval {
+                Button("Approve in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+            }
+            Text("Closing the window keeps Ward running. You can change these options in Settings.")
+                .foregroundStyle(.secondary)
+            HStack { Spacer(); Button("Get started", action: done).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) }
+        }.padding(24).frame(width: 580)
+        .task {
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            notificationState = settings.authorizationStatus == .authorized ? "Allowed" : "Optional"
+        }
     }
 }
 

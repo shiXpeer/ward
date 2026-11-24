@@ -39,7 +39,7 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     user: "101:101"
-    volumes: ["./edge.conf:/etc/nginx/nginx.conf:ro", "trust:/trust:ro"]
+    volumes: ["./edge.conf:/etc/nginx/nginx.conf:ro", "trust:/trust:ro", "./site:/site:ro"]
     tmpfs: ["/tmp:size=32m,mode=1777"]
     networks: [ward, frontend]
     depends_on: [ward-api]

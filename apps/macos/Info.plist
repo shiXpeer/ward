@@ -10,4 +10,9 @@
 <key>CFBundleVersion</key><string>3</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>SUFeedURL</key><string>https://ward.shixpeer.com/releases/appcast.xml</string>
+<key>SUPublicEDKey</key><string>NBXNqfG3yerLoQxNxTywuMoy1OKEi68citb1P5gvUk4=</string>
+<key>SUEnableAutomaticChecks</key><true/>
+<key>SUAutomaticallyUpdate</key><false/>
+<key>SUSendProfileInfo</key><false/>
 </dict></plist>

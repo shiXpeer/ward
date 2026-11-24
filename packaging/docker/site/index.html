@@ -1,0 +1,11 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ward for Mac</title>
+<style>body{margin:0;min-height:100vh;background:radial-gradient(at top left,#42316b,#151024 70%);color:#f3efff;font:18px -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-items:center}main{max-width:740px;padding:48px 28px}h1{font-size:64px;margin:0 0 16px}p{line-height:1.6;color:#c4bbd8}a.button{display:inline-block;background:#7770ff;color:white;border-radius:14px;padding:15px 22px;text-decoration:none;margin:8px 10px 8px 0}section{background:#ffffff0a;border:1px solid #ffffff20;border-radius:24px;padding:24px;margin-top:28px}li{padding:8px 0}footer{margin-top:32px;font-size:15px}a{color:#bcb6ff}#status{font-size:16px}</style>
+<main><h1>Ward for Mac</h1><p>Security findings, application updates and your servers.<br>Your scan stays on your device.</p><div id="downloads"></div><p id="status">Checking release availability…</p><section><strong>Ready in three steps</strong><ol><li>Download and open the disk image.</li><li>Drag Ward into Applications and open it.</li><li>Choose notifications and launch-at-login options.</li></ol><p>Requires macOS 14 or later. The signed scanner database is connected automatically.</p></section><footer><a href="https://github.com/shiXpeer/ward/releases">Releases</a> · <a href="https://github.com/shiXpeer/ward">Source code</a></footer></main>
+<script>
+fetch('/releases/downloads.json',{cache:'no-cache'}).then(r=>{if(!r.ok)throw Error();return r.json()}).then(d=>{
+ const root=document.getElementById('downloads');let count=0;
+ for(const x of d.downloads||[]){const u=new URL(x.url);if(u.protocol!=='https:'||u.hostname!=='github.com'||!u.pathname.startsWith('/shiXpeer/ward/releases/download/'))continue;
+ const a=document.createElement('a');a.className='button';a.href=u.href;a.textContent=x.arch==='arm64'?'Download · Apple Silicon':'Download · Intel';root.append(a);count++;}
+ document.getElementById('status').textContent=count?'Developer ID signed and notarized by Apple.':'The first signed release is being prepared. Downloads will appear here when ready.';
+}).catch(()=>document.getElementById('status').textContent='Release information is temporarily unavailable. Please try again.');
+</script></html>

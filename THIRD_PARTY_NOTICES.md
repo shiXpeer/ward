@@ -95,3 +95,10 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+
+## Sparkle (optional macOS distribution framework)
+
+Release builds embed Sparkle 2.10.1, copyright Andy Matuschak and Sparkle contributors,
+under its permissive license. The complete upstream license and bundled third-party
+notices are included as `Contents/Resources/Sparkle-LICENSE` in the app. Source:
+https://github.com/sparkle-project/Sparkle. Development builds can omit the framework.
