@@ -552,6 +552,67 @@ private struct WardPreferences: Codable {
         if sent { showNotice("Test notification sent.") }
     }
 
+    private var localVersionTimer: Task<Void, Never>?
+    private var localVersionObservers = Set<AnyCancellable>()
+    private var reconcilingLocalVersions = false
+    private var nextSystemReconciliation = Date.distantPast
+
+    fileprivate func reconcileInstalledVersions() async {
+        guard !checkingAppVersions, !installingApplication, !reconcilingLocalVersions else { return }
+        reconcilingLocalVersions = true
+        defer { reconcilingLocalVersions = false }
+        let snapshot = appUpdateChecks
+        let changes = await Task.detached {
+            var changed: [String: AppUpdateRecord] = [:]
+            for (id, record) in snapshot {
+                guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { continue }
+                let updated = AppUpdateReconciliation.reconcile(record, installed: AppUpdateReconciliation.installedVersion(at: url))
+                if updated != record { changed[id] = updated }
+            }
+            return changed
+        }.value
+        guard !checkingAppVersions, !installingApplication else { return }
+        var updated = appUpdateChecks
+        for (id, record) in changes where updated[id] == snapshot[id] { updated[id] = record }
+        if updated != appUpdateChecks {
+            let checkedAt = AppUpdateStore.load()?.date ?? Date(timeIntervalSince1970: 1)
+            appUpdateChecks = updated
+            // Local observations must not extend the remote check cache TTL.
+            AppUpdateStore.save(updated, at: checkedAt)
+        }
+        updateAppBadge(appUpdateChecks, for: Set(appUpdateChecks.keys))
+        if !systemSoftwareUpdates.isEmpty, Date() >= nextSystemReconciliation {
+            nextSystemReconciliation = Date().addingTimeInterval(30)
+            let before = systemSoftwareUpdates
+            let cachedCatalog = Task.detached { try SystemSoftwareUpdate.check(cachedOnly: true) }
+            if let remaining = try? await cachedCatalog.value,
+               !checkingAppVersions, !installingApplication, before == systemSoftwareUpdates {
+                systemSoftwareUpdates = SystemSoftwareUpdate.mergingRestartPending(remaining)
+                if let data = try? JSONEncoder().encode(systemSoftwareUpdates) { UserDefaults.standard.set(data, forKey: "ward.system-software-updates.v1") }
+                updateAppBadge(appUpdateChecks, for: Set(appUpdateChecks.keys))
+            }
+        }
+    }
+
+    private func watchInstalledVersions() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            workspace.publisher(for: name).sink { [weak self] _ in
+                Task { @MainActor in await self?.reconcileInstalledVersions() }
+            }.store(in: &localVersionObservers)
+        }
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
+            Task { @MainActor in await self?.reconcileInstalledVersions() }
+        }.store(in: &localVersionObservers)
+        localVersionTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.reconcileInstalledVersions()
+                do { try await Task.sleep(for: .seconds(10)) } catch { return }
+                guard self != nil else { return }
+            }
+        }
+    }
+
     private enum Maintenance: CaseIterable, Hashable { case database, scan, applications }
     private var nextMaintenance: [Maintenance: Date] = [:]
     private var maintenanceTimer: Task<Void, Never>?
@@ -644,7 +705,13 @@ private struct WardPreferences: Codable {
     @Published fileprivate var systemSoftwareUpdates = SystemSoftwareUpdate.load()
     @Published fileprivate var systemUpdateCheckNote = ""
     fileprivate func updateAppBadge(_ results: [String: AppUpdateRecord], for identifiers: Set<String>) {
-        availableAppUpdateIDs = Set(results.compactMap { identifiers.contains($0.key) && currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil }).union(systemSoftwareUpdates.map(\.id))
+        let ids = Set(results.compactMap { identifiers.contains($0.key) && currentlyNeedsAppUpdate($0.key, record: $0.value) ? $0.key : nil }).union(systemSoftwareUpdates.map(\.id))
+        if ids != availableAppUpdateIDs {
+            availableAppUpdateIDs = ids
+            if !checkingAppVersions {
+                applicationUpdateNote = ids.isEmpty ? "No pending updates." : "\(ids.count.formatted()) updates available."
+            }
+        }
     }
 
     @Published var applicationCheckProgress: (completed: Int, total: Int)?
@@ -696,6 +763,7 @@ private struct WardPreferences: Codable {
                 await self?.runScheduledMaintenance()
             }
         }
+        watchInstalledVersions()
         Task { [weak self] in self?.startLaunchChecks() }
     }
     func add(_ beacon: Beacon, token: String) throws {
@@ -1042,6 +1110,10 @@ private struct WardPreferences: Codable {
             systemUpdateCheckNote = error.localizedDescription + " Previous results retained."
         }
         if showProgress { applicationCheckProgress = (jobs.count + 1, jobs.count + 1) }
+        for (id, record) in results {
+            let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id).flatMap { AppUpdateReconciliation.installedVersion(at: $0) }
+            results[id] = AppUpdateReconciliation.reconcile(record, installed: installed)
+        }
         var notificationResults = results
         for update in systemSoftwareUpdates {
             notificationResults[update.id] = AppUpdateRecord(text: "Available in Software Update", newer: true, canInstall: false, reported: update.version, installed: "")
@@ -4461,10 +4533,38 @@ private struct AppUpdateRecord: Codable, Equatable, Sendable {
     var installed: String
 }
 
+private enum AppUpdateReconciliation {
+    static func installedVersion(at bundle: URL) -> String? {
+        guard let data = try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")),
+              let info = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any],
+              let version = (info["CFBundleShortVersionString"] as? String) ?? (info["CFBundleVersion"] as? String) else { return nil }
+        let value = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+    static func reconcile(_ record: AppUpdateRecord, installed: String?) -> AppUpdateRecord {
+        guard let installed, !installed.isEmpty else { return record }
+        var updated = record
+        updated.installed = installed
+        guard !record.reported.isEmpty, let order = versionOrder(installed, record.reported) else {
+            if installed != record.installed {
+                updated.canInstall = false
+                updated.text = "Installed version changed. Check updates."
+            }
+            return updated
+        }
+        updated.newer = order == .orderedAscending
+        updated.canInstall = record.canInstall && updated.newer
+        if !updated.newer {
+            updated.reported = installed
+            updated.text = ""
+        }
+        return updated
+    }
+}
+
 private func currentlyNeedsAppUpdate(_ id: String, record: AppUpdateRecord) -> Bool {
     guard record.newer, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id),
-          let info = NSDictionary(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
-          let version = (info["CFBundleShortVersionString"] as? String) ?? (info["CFBundleVersion"] as? String) else { return false }
+          let version = AppUpdateReconciliation.installedVersion(at: url) else { return false }
     if let order = versionOrder(version, record.reported) { return order == .orderedAscending }
     return version == record.installed
 }
@@ -4498,7 +4598,7 @@ private struct SystemSoftwareUpdate: Codable, Identifiable, Equatable {
         }
         return updates
     }
-    static func check() throws -> [Self] {
+    static func check(cachedOnly: Bool = false) throws -> [Self] {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
         defer { try? FileManager.default.removeItem(at: file) }
@@ -4506,7 +4606,7 @@ private struct SystemSoftwareUpdate: Codable, Identifiable, Equatable {
         defer { try? handle.close() }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/softwareupdate")
-        process.arguments = ["--list"]
+        process.arguments = cachedOnly ? ["--list", "--no-scan"] : ["--list"]
         process.environment = ProcessInfo.processInfo.environment.merging(["LC_ALL": "C", "LANG": "en_US.UTF-8"]) { _, new in new }
         process.standardOutput = handle; process.standardError = handle
         process.standardInput = FileHandle.nullDevice
