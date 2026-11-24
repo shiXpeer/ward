@@ -557,8 +557,32 @@ private struct WardPreferences: Codable {
     private var reconcilingLocalVersions = false
     private var nextSystemReconciliation = Date.distantPast
 
+    private var hasPendingLocalVersions: Bool {
+        appUpdateChecks.contains { id, record in
+            record.newer && (availableAppUpdateIDs.contains(id) || NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) != nil)
+        } || systemSoftwareUpdates.contains { $0.pendingRestart != true }
+    }
+
+    private var versionsForeground: Bool {
+        NSApp.isActive && NSApp.windows.contains { $0.isVisible && $0.canBecomeKey && $0.styleMask.contains(.titled) }
+    }
+
+    private func scheduleLocalVersionCheck(immediate: Bool = false) {
+        localVersionTimer?.cancel()
+        localVersionTimer = nil
+        guard hasPendingLocalVersions else { return }
+        let delay: Duration = immediate ? .zero : versionsForeground ? .seconds(5) : .seconds(60)
+        localVersionTimer = Task { [weak self] in
+            do { try await Task.sleep(for: delay) } catch { return }
+            guard !Task.isCancelled else { return }
+            await self?.reconcileInstalledVersions()
+            guard !Task.isCancelled else { return }
+            self?.scheduleLocalVersionCheck()
+        }
+    }
+
     fileprivate func reconcileInstalledVersions() async {
-        guard !checkingAppVersions, !installingApplication, !reconcilingLocalVersions else { return }
+        guard hasPendingLocalVersions, !checkingAppVersions, !installingApplication, !reconcilingLocalVersions else { return }
         reconcilingLocalVersions = true
         defer { reconcilingLocalVersions = false }
         let snapshot = appUpdateChecks
@@ -582,7 +606,7 @@ private struct WardPreferences: Codable {
         }
         updateAppBadge(appUpdateChecks, for: Set(appUpdateChecks.keys))
         if !systemSoftwareUpdates.isEmpty, Date() >= nextSystemReconciliation {
-            nextSystemReconciliation = Date().addingTimeInterval(30)
+            nextSystemReconciliation = Date().addingTimeInterval(versionsForeground ? 10 : 60)
             let before = systemSoftwareUpdates
             let cachedCatalog = Task.detached { try SystemSoftwareUpdate.check(cachedOnly: true) }
             if let remaining = try? await cachedCatalog.value,
@@ -597,20 +621,38 @@ private struct WardPreferences: Codable {
     private func watchInstalledVersions() {
         let workspace = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
-            workspace.publisher(for: name).sink { [weak self] _ in
-                Task { @MainActor in await self?.reconcileInstalledVersions() }
+            workspace.publisher(for: name).sink { [weak self] event in
+                guard let application = event.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let id = application.bundleIdentifier else { return }
+                Task { @MainActor in
+                    guard let self, self.appUpdateChecks[id]?.newer == true else { return }
+                    self.scheduleLocalVersionCheck(immediate: true)
+                }
             }.store(in: &localVersionObservers)
         }
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
-            Task { @MainActor in await self?.reconcileInstalledVersions() }
-        }.store(in: &localVersionObservers)
-        localVersionTimer = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.reconcileInstalledVersions()
-                do { try await Task.sleep(for: .seconds(10)) } catch { return }
-                guard self != nil else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                self.nextSystemReconciliation = .distantPast
+                self.scheduleLocalVersionCheck(immediate: true)
             }
+        }.store(in: &localVersionObservers)
+        for name in [NSApplication.didResignActiveNotification, NSWindow.willCloseNotification] {
+            NotificationCenter.default.publisher(for: name).sink { [weak self] _ in
+                Task { @MainActor in
+                    await Task.yield()
+                    self?.scheduleLocalVersionCheck()
+                }
+            }.store(in: &localVersionObservers)
         }
+        // Property publishers emit before assignment: defer scheduling until the
+        // new pending set is visible. No pending versions means no timer at all.
+        $appUpdateChecks.map { _ in () }
+            .merge(with: $availableAppUpdateIDs.map { _ in () }, $systemSoftwareUpdates.map { _ in () })
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.scheduleLocalVersionCheck() }
+            }.store(in: &localVersionObservers)
+        scheduleLocalVersionCheck(immediate: true)
     }
 
     private enum Maintenance: CaseIterable, Hashable { case database, scan, applications }
