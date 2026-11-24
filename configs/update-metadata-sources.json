@@ -1,0 +1,96 @@
+{
+  "sources": [
+    {
+      "origin": "https://itunes.apple.com",
+      "path_prefix": "/lookup"
+    },
+    {
+      "origin": "https://data.services.jetbrains.com",
+      "path_prefix": "/products/"
+    },
+    {
+      "origin": "https://update.code.visualstudio.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://desktop.docker.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://api.github.com",
+      "path_prefix": "/repos/"
+    },
+    {
+      "origin": "https://github.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://objects.githubusercontent.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://release-assets.githubusercontent.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://api2.cursor.sh",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://cdn-mlx-prod.multiloginapp.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://cdn.electronic.us",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://dbeaver.io",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://download.sqlitebrowser.org",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://imageoptim.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://iterm2.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://persistent.oaistatic.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://pkgs.tailscale.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://stuntsoftware.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://u.keka.io",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://update.videolan.org",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://updates.devmate.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://download.jetbrains.com",
+      "path_prefix": "/"
+    },
+    {
+      "origin": "https://download-cdn.jetbrains.com",
+      "path_prefix": "/"
+    }
+  ]
+}

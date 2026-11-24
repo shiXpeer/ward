@@ -1,0 +1,10 @@
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates && \
+    mkdir -p /state /public /signing /tls /trust /metadata-cache && \
+    chown 10001:10001 /state /public /signing /tls /trust /metadata-cache && \
+    chmod 700 /state /signing /tls /metadata-cache
+COPY shixpeer-ward-beacon /usr/local/bin/shixpeer-ward-beacon
+COPY configs /etc/ward
+COPY init.sh /usr/local/bin/ward-init
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/shixpeer-ward-beacon"]

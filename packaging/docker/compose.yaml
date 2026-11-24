@@ -1,0 +1,60 @@
+name: shixpeer-ward
+x-runtime: &runtime
+  image: shixpeer-ward-backend:local
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:size=256m,mode=1777"]
+  networks: [ward]
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "3"}
+services:
+  ward-init:
+    <<: *runtime
+    build: {context: ./build, dockerfile: Dockerfile}
+    entrypoint: [/usr/local/bin/ward-init]
+    volumes: [public:/public, signing:/signing, tls:/tls, trust:/trust]
+    restart: "no"
+  ward-api:
+    <<: *runtime
+    command: [serve, -out, /public, -listen, "0.0.0.0:8443", -tls-cert, /tls/server.crt, -tls-key, /tls/server.key, -update-sources, /etc/ward/update-metadata-sources.json, -update-cache, /metadata-cache]
+    volumes: ["public:/public:ro", "tls:/tls:ro", "metadata-cache:/metadata-cache"]
+    depends_on: {ward-init: {condition: service_completed_successfully}}
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 2
+  ward-publisher:
+    <<: *runtime
+    command: [run, -state, /state, -out, /public, -sources, /etc/ward/beacon.default.json, -signing-key, /signing/signing.key, -sync-interval, 6h, -ttl, 24h, -source-workers, "2", -listen, "127.0.0.1:8443", -tls-cert, /tls/server.crt, -tls-key, /tls/server.key]
+    volumes: [state:/state, public:/public, "signing:/signing:ro", "tls:/tls:ro"]
+    depends_on: {ward-init: {condition: service_completed_successfully}}
+    restart: unless-stopped
+    mem_limit: 32g
+    cpus: 4
+  ward-edge:
+    image: nginx:alpine
+    entrypoint: [nginx, "-g", "daemon off;"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "101:101"
+    volumes: ["./edge.conf:/etc/nginx/nginx.conf:ro", "trust:/trust:ro"]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    networks: [ward, frontend]
+    depends_on: [ward-api]
+    restart: unless-stopped
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+networks:
+  ward: {}
+  frontend: {external: true, name: compose_default}
+volumes:
+  state: {}
+  metadata-cache: {}
+  public: {}
+  signing: {}
+  tls: {}
+  trust: {}

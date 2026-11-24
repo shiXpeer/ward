@@ -26,6 +26,7 @@ import (
 	"shixpeer.com/ward/internal/netpolicy"
 	"shixpeer.com/ward/internal/paths"
 	"shixpeer.com/ward/internal/productid"
+	"shixpeer.com/ward/internal/updategateway"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +58,8 @@ func run(args []string) error {
 		return errors.New("HOME must be an absolute directory")
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	metadataSources := fs.String("update-sources", "", "operator-approved public update metadata sources JSON")
+	metadataCache := fs.String("update-cache", "", "bounded Homebrew metadata disk cache (with update-sources)")
 	binaries := fs.String("binaries", "", "release: directory containing Linux agents for amd64 and arm64")
 	releaseTTL := fs.Duration("release-ttl", 7*24*time.Hour, "release: installer artifact validity, max 30d")
 	dir := fs.String("state", paths.State("beacon"), "private state directory, no SQL required")
@@ -234,7 +237,36 @@ func run(args []string) error {
 	if info.Mode().Perm()&0077 != 0 {
 		return errors.New("TLS private key must have mode 0600 or stricter")
 	}
-	srv := &http.Server{Addr: *listen, Handler: publish.Artifacts(*out), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 30 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+	handler := publish.Artifacts(*out)
+	if *metadataSources != "" {
+		raw, err := os.ReadFile(*metadataSources)
+		if err != nil {
+			return err
+		}
+		if len(raw) > 65536 {
+			return errors.New("update sources config too large")
+		}
+		var cfg updategateway.Config
+		if err = json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+		gateway, err := updategateway.New(cfg)
+		if err != nil {
+			return err
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/v1/update-metadata", gateway)
+		if *metadataCache != "" {
+			mirror, err := updategateway.NewHomebrew(*metadataCache)
+			if err != nil {
+				return err
+			}
+			mux.Handle("/v1/homebrew/", mirror)
+		}
+		mux.Handle("/", handler)
+		handler = mux
+	}
+	srv := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 30 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServeTLS(*cert, *tlskey) }()
 	select {
