@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -117,5 +118,16 @@ func TestRedirectPolicy(t *testing.T) {
 		if g.client.CheckRedirect(r, nil) == nil {
 			t.Fatal(raw)
 		}
+	}
+}
+
+func TestOriginWithoutExplicitSlash(t *testing.T) {
+	g, err := New(Config{Sources: []Source{{Origin: "https://feed.example", PathPrefix: "/"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse("https://feed.example")
+	if !g.allowed(u) {
+		t.Fatal("origin-only feed URL must mean root path")
 	}
 }

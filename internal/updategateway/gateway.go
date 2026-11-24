@@ -87,11 +87,17 @@ func (g *Gateway) allowed(u *url.URL) bool {
 	}
 	for _, s := range g.sources {
 		origin, _ := url.Parse(s.Origin)
-		if strings.EqualFold(u.Hostname(), origin.Hostname()) && strings.HasPrefix(u.Path, s.PathPrefix) {
+		if strings.EqualFold(u.Hostname(), origin.Hostname()) && strings.HasPrefix(metadataPath(u), s.PathPrefix) {
 			return true
 		}
 	}
 	return false
+}
+func metadataPath(u *url.URL) string {
+	if u.Path == "" {
+		return "/"
+	}
+	return u.Path
 }
 func publicIP(ip netip.Addr) bool {
 	ip = ip.Unmap()
