@@ -256,12 +256,40 @@ func run(args []string) error {
 		}
 		mux := http.NewServeMux()
 		mux.Handle("/v1/update-metadata", gateway)
+		resolver, err := updategateway.NewResolver(gateway, cfg.VersionRules)
+		if err != nil {
+			return err
+		}
+		mux.Handle("/v1/app-version", resolver)
+		go resolver.Refresh(ctx)
 		if *metadataCache != "" {
 			mirror, err := updategateway.NewHomebrew(*metadataCache)
 			if err != nil {
 				return err
 			}
 			mux.Handle("/v1/homebrew/", mirror)
+			diagnostics, err := updategateway.NewDiagnostics(filepath.Join(*metadataCache, "diagnostics"))
+			if err != nil {
+				return err
+			}
+			if err := diagnostics.Prune(); err != nil {
+				return err
+			}
+			go func() {
+				ticker := time.NewTicker(time.Hour)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if diagnostics.Prune() != nil {
+							log.Print("diagnostic retention maintenance failed")
+						}
+					}
+				}
+			}()
+			mux.Handle("/v1/update-failures", diagnostics)
 		}
 		mux.Handle("/", handler)
 		handler = mux

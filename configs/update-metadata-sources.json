@@ -91,6 +91,11 @@
     {
       "origin": "https://download-cdn.jetbrains.com",
       "path_prefix": "/"
+    },
+    {
+      "origin": "https://ward.shixpeer.com",
+      "path_prefix": "/releases/"
     }
-  ]
+  ],
+  "version_rules": []
 }

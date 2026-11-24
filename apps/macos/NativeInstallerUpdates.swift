@@ -109,32 +109,4 @@ enum NativeInstallerUpdates {
         guard parser.parse(), Set(delegate.versions).count == 1 else { return nil }
         return delegate.versions.first
     }
-    private static func range(_ url: URL, start: Int, length: Int) async throws -> Data {
-        guard start >= 0, length > 0, length <= 1_048_576 else { throw URLError(.dataLengthExceedsMaximum) }
-        let (data, http) = try await MetadataBackend.shared.fetch(url, range: "bytes=\(start)-\(start + length - 1)", maxBytes: length)
-        guard http.statusCode == 206,
-              http.value(forHTTPHeaderField: "Content-Range")?.hasPrefix("bytes \(start)-\(start+length-1)/") == true,
-              data.count == length else { throw URLError(.badServerResponse) }
-        return data
-    }
-    static func version(_ urls: [URL], id: String) async throws -> String {
-        var versions = Set<String>()
-        for url in urls {
-            do {
-                let header = try await range(url, start: 0, length: 28)
-                guard header.prefix(4) == Data("xar!".utf8) else { continue }
-                let length = header[8..<16].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-                guard length > 0, length <= 1_048_576 else { continue }
-                let toc = try await range(url, start: 28, length: Int(length))
-                let (base, entries) = try members(header: header, toc: toc)
-                for entry in entries {
-                    let data = try await range(url, start: base + entry.offset, length: entry.length)
-                    let info = entry.compressed ? try inflate(data, maximum: entry.size) : data
-                    if let version = bundleVersion(info, id: id) { versions.insert(version) }
-                }
-            } catch { continue }
-        }
-        guard versions.count == 1, let version = versions.first else { throw WardError("No unambiguous installer metadata for this app.") }
-        return version
-    }
 }

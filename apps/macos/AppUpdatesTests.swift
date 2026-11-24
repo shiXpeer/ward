@@ -28,6 +28,14 @@ import zlib
         for value in ["http://updates.example/latest", "https://user:secret@updates.example/latest", "https://updates.example/latest#fragment"] {
             do { _ = try OfficialWardBackend.metadataRequest(URL(string: value)!); fatalError("Invalid metadata destination") } catch {}
         }
+        var query = BackendVersionQuery(bundle: "com.example.fixture")
+        query.channel = "sparkle"; query.url = "https://feed.example/appcast.xml"
+        let queryData = try JSONEncoder().encode(query)
+        let queryObject = try JSONSerialization.jsonObject(with: queryData) as! [String: Any]
+        precondition(queryObject["installed"] == nil && queryObject["hostname"] == nil && queryObject["device_id"] == nil)
+        precondition(queryObject["bundle_id"] as? String == "com.example.fixture")
+        let privacy = WardPreferences()
+        precondition(privacy.anonymousUpdateFailures != true)
         print("PASS: version metadata routes to the Ward backend without forwarding credentials")
         let launch = LaunchChecks()
         var order: [LaunchChecks.Step] = []

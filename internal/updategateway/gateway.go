@@ -26,7 +26,8 @@ type Source struct {
 	PathPrefix string `json:"path_prefix"`
 }
 type Config struct {
-	Sources []Source `json:"sources"`
+	Sources      []Source      `json:"sources"`
+	VersionRules []VersionRule `json:"version_rules,omitempty"`
 }
 type Request struct {
 	URL   string `json:"url"`

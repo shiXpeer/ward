@@ -354,6 +354,8 @@ private struct WardPreferences: Codable {
     var scanMinutes = 0
     var scanAfterDatabaseUpdate: Bool? = nil
     var applicationMinutes = 0
+    var backendSubscriptions: Bool? = nil
+    var anonymousUpdateFailures: Bool? = nil
     var checksOnLaunch: Bool? = nil
     var launchChecks: Bool {
         get { checksOnLaunch ?? true }
@@ -521,6 +523,52 @@ private struct WardPreferences: Codable {
     private let launchChecks = LaunchChecks()
     private var launchChecksTask: Task<Void, Never>?
     private var runningLaunchChecks = false
+    private var versionSubscription: Task<Void, Never>?
+    private var subscribedApplications: [Report.Inventory.Application] = []
+    private func subscribeToVersions(_ apps: [Report.Inventory.Application]) {
+        subscribedApplications = Array(apps.prefix(128))
+        guard versionSubscription == nil else { return }
+        versionSubscription = Task { [weak self] in
+            while !Task.isCancelled {
+                let foreground = NSApp.isActive
+                do { try await Task.sleep(for: .seconds(foreground ? 60 : 300)) } catch { return }
+                guard let self else { return }
+                guard self.preferences.backendSubscriptions ?? true,
+                      !self.checkingAppVersions, !self.busy, !self.installingApplication else { continue }
+                let apps = self.subscribedApplications
+                let jobs = await Task.detached { updateJobs(for: apps) }.value
+                var refreshed: [String: AppUpdateRecord] = [:]
+                for job in jobs {
+                    let record = await job.lookup()
+                    if !record.reported.isEmpty { refreshed[job.id] = record }
+                }
+                let knownIDs = Set(jobs.map(\.id))
+                for app in apps where !knownIDs.contains(app.identifier) && !app.isApple {
+                    switch appChannel(app) {
+                    case .none, .sparkleUnlisted:
+                        if let version = await MetadataBackend.shared.fallbackVersion(for: app.identifier) {
+                            refreshed[app.identifier] = AppUpdateJob.record(channel: "its update source", installed: liveVersion(app), reported: version, canInstall: false)
+                        }
+                    default: break
+                    }
+                }
+                guard !self.checkingAppVersions, !self.busy, !self.installingApplication else { continue }
+                self.appUpdateChecks.merge(refreshed) { _, new in new }
+                if !refreshed.isEmpty {
+                    AppUpdateStore.save(self.appUpdateChecks)
+                    self.updateAppBadge(self.appUpdateChecks, for: Set(apps.map(\.identifier)))
+                    let key = "ward.application-update-notifications.v2"
+                    var notified = UserDefaults.standard.dictionary(forKey: key) as? [String:String] ?? [:]
+                    let pending = AppUpdateAlerts.pending(refreshed, notified: notified)
+                    if self.preferences.applicationNotifications, !pending.isEmpty,
+                       await self.deliverSystemNotification(title: "Updates available", body: "\(pending.count) updates available. Open Applications for details.") {
+                        for (id, record) in pending { notified[id] = record.reported }
+                        UserDefaults.standard.set(notified, forKey: key)
+                    }
+                }
+            }
+        }
+    }
     @Published fileprivate var notificationIssue = ""
 
     fileprivate func startLaunchChecks() {
@@ -1147,6 +1195,7 @@ private struct WardPreferences: Codable {
             let scanned = devices.first(where: { $0.id == "local" })?.report.inventory.applications ?? []
             apps = scanned + outsideApplications(known: Set(scanned.map(\.identifier)), includeStandardLocations: true)
         }
+        subscribeToVersions(apps)
         let minimumEnd = ContinuousClock.now + .milliseconds(900)
         let jobs = await Task.detached { updateJobs(for: apps) }.value
         async let systemCheck: Result<[SystemSoftwareUpdate], Error> = Task.detached {
@@ -1163,6 +1212,36 @@ private struct WardPreferences: Codable {
             }
             return found
         }
+        // Only unresolved applications are queried by bundle ID. No installed version is sent.
+        let unsupported = await Task.detached {
+            apps.filter { app in
+                guard !app.identifier.isEmpty, !app.isApple else { return false }
+                switch appChannel(app) { case .none, .sparkleUnlisted: return true; default: return false }
+            }
+        }.value
+        var unresolved: [String: (String, String)] = [:]
+        for app in unsupported { unresolved[app.identifier] = (app.version, "unsupported_channel") }
+        for job in jobs where results[job.id]?.reported.isEmpty == true {
+            unresolved[job.id] = (job.installed, "check_failed")
+        }
+        let allowDiagnostics = preferences.anonymousUpdateFailures ?? false
+        let recovered = await withTaskGroup(of: (String, AppUpdateRecord?).self) { group in
+            for (id, context) in unresolved.sorted(by: { $0.key < $1.key }).prefix(128) {
+                group.addTask {
+                    if context.1 == "unsupported_channel", let version = await MetadataBackend.shared.fallbackVersion(for: id) {
+                        return (id, AppUpdateJob.record(channel: "its update source", installed: context.0, reported: version, canInstall: false))
+                    }
+                    if allowDiagnostics {
+                        await MetadataBackend.shared.reportFailure(.init(bundle_id: id, reason: context.1))
+                    }
+                    return (id, nil)
+                }
+            }
+            var records: [String: AppUpdateRecord] = [:]
+            for await (id, record) in group { if let record { records[id] = record } }
+            return records
+        }
+        results.merge(recovered) { _, new in new }
         for (id, failed) in results where failed.reported.isEmpty {
             if var known = appUpdateChecks[id], known.newer, known.installed == failed.installed {
                 if !known.text.hasPrefix("Could not refresh.") { known.text = "Could not refresh. " + known.text }
@@ -1736,6 +1815,11 @@ private struct WardWelcome: View {
                     }
                 }.disabled(notificationState == "Allowed")
             }
+            Toggle("Share anonymous update-check failures", isOn: Binding(
+                get: { model.preferences.anonymousUpdateFailures ?? false },
+                set: { model.preferences.anonymousUpdateFailures = $0 }))
+            Text("Unresolved app IDs and error categories only. No installed versions or device identifiers.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Launch Ward at login", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
             if model.loginStatus == .requiresApproval {
                 Button("Approve in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
@@ -1966,6 +2050,14 @@ private struct WardSettingsPage: View {
                 }
                 section("Application versions", symbol: "macwindow") {
                     interval("Check installed applications for new versions", selection: $model.preferences.applicationMinutes)
+                    Toggle("Subscribe to application updates from Ward", isOn: Binding(
+                        get: { model.preferences.backendSubscriptions ?? true },
+                        set: { model.preferences.backendSubscriptions = $0 }))
+                    Toggle("Share anonymous update-check failures", isOn: Binding(
+                        get: { model.preferences.anonymousUpdateFailures ?? false },
+                        set: { model.preferences.anonymousUpdateFailures = $0 }))
+                    Text("Only unresolved app IDs and error categories. No installed versions, device IDs, paths or URLs. Daily event counts are retained for 30 days; they are not unique-user counts.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("Checks supported update channels while Ward is running.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -5335,40 +5427,23 @@ private struct AppUpdateJob: Sendable {
 
     func lookup() async -> AppUpdateRecord {
         do {
+            var query = BackendVersionQuery(bundle: id)
+            var channel = "its updater"
+            var signingKey = true
             switch target {
-            case .installerMetadata(let urls):
-                let version = try await NativeInstallerUpdates.version(urls, id: id)
-                return Self.record(channel: "its installer metadata", installed: installed, reported: version, canInstall: false)
-            case .jetBrains(let code):
-                let package = try await jetBrainsPackage(code)
-                return Self.record(channel: "JetBrains", installed: installed, reported: package.version,
-                                   canInstall: package.url != nil)
-            case .appStore(let bundleID):
-                let reported = try await Self.appStoreVersion(bundleID)
-                return Self.record(channel: "the App Store", installed: installed, reported: reported, canInstall: false)
-            case .sparkle(let url, let hasKey):
-                let xml = String(decoding: try await fetchHTTPS(url), as: UTF8.self)
-                guard let reported = newestComparable(sparkleVersions(xml)) else { throw URLError(.badServerResponse) }
-                let base = Self.record(channel: "Sparkle", installed: installed, reported: reported, canInstall: false)
-                let installable = base.newer && hasKey && sparkleInstallableArchive(xml, version: reported, feed: url) != nil
-                return AppUpdateRecord(text: base.text, newer: base.newer, canInstall: installable, reported: reported, installed: installed)
-            case .electron(let url):
-                let package = try await electronPackage(url)
-                return Self.record(channel: "its updater", installed: installed, reported: package.version,
-                                   canInstall: package.url != nil)
-            case .vscode(let base, let platform, let name, let quality):
-                return try await Self.vscodeRecord(base: base, platform: platform, name: name, quality: quality, installed: installed)
-            case .dockerDesktop(let executable):
-                let reported = try await Self.dockerDesktopVersion(executable)
-                return Self.record(channel: "Docker Desktop", installed: installed, reported: reported, canInstall: false)
-            case .productXML(let url):
-                let data = try await fetchHTTPS(url)
-                guard let reported = productXMLVersion(data) else { throw URLError(.badServerResponse) }
-                return Self.record(channel: "its product update feed", installed: installed, reported: reported, canInstall: false)
-            case .plain(let url):
-                let reported = try await Self.plainVersion(url)
-                return Self.record(channel: "its updater", installed: installed, reported: reported, canInstall: false)
+            case .installerMetadata(let urls): query.channel = "installer_metadata"; query.urls = urls.map(\.absoluteString)
+            case .jetBrains(let code): query.channel = "jetbrains"; query.code = code; channel = "JetBrains"
+            case .appStore: query.channel = "app_store"; channel = "the App Store"
+            case .sparkle(let url, let hasKey): query.channel = "sparkle"; query.url = url.absoluteString; signingKey = hasKey; channel = "Sparkle"
+            case .electron(let url): query.channel = "electron"; query.url = url.absoluteString
+            case .vscode(let base, let platform, let name, let quality): query.channel = "vscode"; query.url = base.absoluteString; query.platform = platform; query.name = name; query.quality = quality
+            case .dockerDesktop: query.channel = "docker"; channel = "Docker Desktop"
+            case .productXML(let url): query.channel = "product_xml"; query.url = url.absoluteString
+            case .plain(let url): query.channel = "plain"; query.url = url.absoluteString
             }
+            let reply = try await MetadataBackend.shared.version(query)
+            return Self.record(channel: channel, installed: installed, reported: reply.version,
+                               canInstall: reply.installable && signingKey)
         } catch {
             let text: String
             switch target {
@@ -5382,21 +5457,7 @@ private struct AppUpdateJob: Sendable {
         }
     }
 
-    private static func dockerDesktopVersion(_ executable: URL) async throws -> String {
-        let arch = currentCPU() == "arm64" ? "arm64" : "amd64"
-        let url = URL(string: "https://desktop.docker.com/mac/main/" + arch + "/appcast.json")!
-        struct Feed: Decodable {
-            struct Item: Decodable { let AppVersion: String; let Visibility: String? }
-            let Items: [Item]
-        }
-        let feed = try JSONDecoder().decode(Feed.self, from: await fetchHTTPS(url))
-        guard let version = newestComparable(feed.Items.filter { ($0.Visibility.flatMap(Double.init) ?? 0) > 0 }.map(\.AppVersion)) else {
-            throw WardError("No published stable Docker Desktop version.")
-        }
-        return version
-    }
-
-    private static func record(channel: String, installed: String, reported: String, canInstall: Bool) -> AppUpdateRecord {
+    static func record(channel: String, installed: String, reported: String, canInstall: Bool) -> AppUpdateRecord {
         let text: String
         let newer: Bool
         if let order = versionOrder(installed, reported) {
@@ -5418,46 +5479,7 @@ private struct AppUpdateJob: Sendable {
         return AppUpdateRecord(text: text, newer: newer, canInstall: canInstall && newer, reported: reported, installed: installed)
     }
 
-    private static func appStoreVersion(_ bundleID: String) async throws -> String {
-        guard appStoreIdentifier(bundleID),
-              var parts = URLComponents(string: "https://itunes.apple.com/lookup") else { throw URLError(.badURL) }
-        parts.queryItems = [URLQueryItem(name: "bundleId", value: bundleID)]
-        guard let url = parts.url else { throw URLError(.badURL) }
-        let data = try await fetchHTTPS(url)
-        struct Lookup: Decodable {
-            struct Item: Decodable { let version, bundleId: String? }
-            let results: [Item]
-        }
-        let lookup = try JSONDecoder().decode(Lookup.self, from: data)
-        guard let item = lookup.results.first, item.bundleId == bundleID, let version = item.version, !version.isEmpty else {
-            throw URLError(.badServerResponse)
-        }
-        return version
-    }
 
-    private static func vscodeRecord(base: URL, platform: String, name: String, quality: String, installed: String) async throws -> AppUpdateRecord {
-        guard let url = vscodeCheckURL(base: base, platform: platform, name: name, quality: quality, installed: installed) else {
-            throw URLError(.badURL)
-        }
-        let (data, status) = try await fetchHTTPSStatus(url)
-        if status == 204 {
-            return record(channel: "its updater", installed: installed, reported: installed, canInstall: false)
-        }
-        struct Payload: Decodable { let url, name: String; let sha256hash: String? }
-        let payload = try JSONDecoder().decode(Payload.self, from: data)
-        let archive = httpsUpdateURL(payload.url)
-        let zip = archive?.path.lowercased().hasSuffix(".zip") == true
-        let baseRecord = record(channel: "its updater", installed: installed, reported: payload.name, canInstall: false)
-        let installable = baseRecord.newer && zip
-        return AppUpdateRecord(text: baseRecord.text, newer: baseRecord.newer, canInstall: installable, reported: payload.name, installed: installed)
-    }
-
-    private static func plainVersion(_ url: URL) async throws -> String {
-        let text = String(decoding: try await fetchHTTPS(url), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = text.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
-        guard versionOrder(token, token) != nil else { throw URLError(.badServerResponse) }
-        return token
-    }
 }
 
 private func appStoreIdentifier(_ identifier: String) -> Bool {
