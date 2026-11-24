@@ -18,7 +18,18 @@ import zlib
         append(28,2); append(1,2); append(UInt64(compressed),8); append(UInt64(expanded),8); append(0,4)
         return data
     }
-    static func main() async throws {
+    @MainActor static func main() async throws {
+        let launch = LaunchChecks()
+        var order: [LaunchChecks.Step] = []
+        await launch.run(enabled: false, ready: { true }, perform: { order.append($0) })
+        precondition(!launch.started && order.isEmpty)
+        await launch.run(enabled: true, ready: { true }, perform: { step in order.append(step); await Task.yield() })
+        precondition(order == [.database, .scan, .applications])
+        await launch.run(enabled: true, ready: { true }, perform: { order.append($0) })
+        precondition(order.count == 3, "Reopening a window must not repeat launch checks")
+        let cancelledLaunch = LaunchChecks()
+        await cancelledLaunch.run(enabled: true, ready: { false }, perform: { _ in fatalError("Started while not ready") })
+        print("PASS: launch check order, disabled startup, once-only scheduling and readiness gating")
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }

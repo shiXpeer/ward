@@ -350,6 +350,11 @@ private struct WardPreferences: Codable {
     var scanMinutes = 0
     var scanAfterDatabaseUpdate: Bool? = nil
     var applicationMinutes = 0
+    var checksOnLaunch: Bool? = nil
+    var launchChecks: Bool {
+        get { checksOnLaunch ?? true }
+        set { checksOnLaunch = newValue }
+    }
     var notifyApplicationUpdates: Bool? = nil
     var notifyNewFindings: Bool? = nil
 
@@ -374,6 +379,19 @@ private struct WardPreferences: Codable {
         guard let data = UserDefaults.standard.data(forKey: key),
               let value = try? JSONDecoder().decode(Self.self, from: data) else { return .init() }
         return value
+    }
+}
+
+@MainActor private final class LaunchChecks {
+    enum Step: CaseIterable { case database, scan, applications }
+    private(set) var started = false
+    func run(enabled: Bool, ready: () async -> Bool, perform: (Step) async -> Void) async {
+        guard enabled, !started else { return }
+        started = true
+        for step in Step.allCases {
+            guard !Task.isCancelled, await ready() else { return }
+            await perform(step)
+        }
     }
 }
 
@@ -496,6 +514,43 @@ private struct WardPreferences: Codable {
         }
     }
 
+    private let launchChecks = LaunchChecks()
+    private var launchChecksTask: Task<Void, Never>?
+    private var runningLaunchChecks = false
+    @Published fileprivate var notificationIssue = ""
+
+    fileprivate func startLaunchChecks() {
+        guard preferences.launchChecks, !launchChecks.started, launchChecksTask == nil else { return }
+        runningLaunchChecks = true
+        launchChecksTask = Task { [weak self] in
+            guard let self else { return }
+            defer { runningLaunchChecks = false; launchChecksTask = nil }
+            await launchChecks.run(enabled: preferences.launchChecks, ready: {
+                while self.busy || self.checkingAppVersions || self.installingApplication {
+                    do { try await Task.sleep(for: .milliseconds(100)) } catch { return false }
+                }
+                return self.preferences.launchChecks && !Task.isCancelled
+            }, perform: { step in
+                switch step {
+                case .database:
+                    await self.localScan(update: true, updateOnly: true, checkOnly: !self.preferences.downloadDatabase, background: true, followUp: false)
+                    self.schedule(.database)
+                case .scan:
+                    await self.localScan(update: false, background: true, followUp: false)
+                    self.schedule(.scan)
+                case .applications:
+                    await self.checkApplicationVersions()
+                    self.schedule(.applications)
+                }
+            })
+        }
+    }
+
+    fileprivate func sendTestNotification() async {
+        let sent = await deliverSystemNotification(title: "Ward notifications", body: "Notifications for new application and system updates are working.")
+        if sent { showNotice("Test notification sent.") }
+    }
+
     private enum Maintenance: CaseIterable, Hashable { case database, scan, applications }
     private var nextMaintenance: [Maintenance: Date] = [:]
     private var maintenanceTimer: Task<Void, Never>?
@@ -519,7 +574,7 @@ private struct WardPreferences: Codable {
     }
 
     private func runScheduledMaintenance() async {
-        guard !busy, !checkingAppVersions, !installingApplication else { return }
+        guard !runningLaunchChecks, !busy, !checkingAppVersions, !installingApplication else { return }
         let now = Date()
         guard let due = nextMaintenance.min(by: { $0.value < $1.value }), due.value <= now else { return }
         let job = due.key
@@ -640,6 +695,7 @@ private struct WardPreferences: Codable {
                 await self?.runScheduledMaintenance()
             }
         }
+        Task { [weak self] in self?.startLaunchChecks() }
     }
     func add(_ beacon: Beacon, token: String) throws {
         _ = try Wire.origin(beacon.feed)
@@ -902,13 +958,20 @@ private struct WardPreferences: Codable {
             _ = try? await center.requestAuthorization(options: [.alert, .sound])
             settings = await center.notificationSettings()
         }
-        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return false }
+        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+            notificationIssue = "macOS blocks Ward notifications. Enable them in System Settings → Notifications."
+            return false
+        }
+        notificationIssue = settings.alertSetting == .enabled ? "" : "macOS banners are off. Notifications may appear only in Notification Center."
         let content = UNMutableNotificationContent()
         content.title = title; content.body = body; content.sound = .default
         do {
             try await center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
             return true
-        } catch { return false }
+        } catch {
+            notificationIssue = "Could not send a system notification: " + error.localizedDescription
+            return false
+        }
     }
     private func postSystemNotification(title: String, body: String) {
         Task { _ = await deliverSystemNotification(title: title, body: body) }
@@ -1024,7 +1087,7 @@ private struct WardPreferences: Codable {
         if let scanProcess, scanProcess.isRunning { scanProcess.terminate() }
     }
 
-    func localScan(update: Bool, updateOnly: Bool = false, checkOnly: Bool = false, background: Bool = false) async {
+    func localScan(update: Bool, updateOnly: Bool = false, checkOnly: Bool = false, background: Bool = false, followUp: Bool = true) async {
         guard !busy, !checkingAppVersions, !installingApplication else { return }
         busy = true
         message = ""
@@ -1080,7 +1143,7 @@ private struct WardPreferences: Codable {
                 }
                 databaseUpdateAvailable = false
                 let installedNewRevision = scanProgress?.stage == "updated" && scanProgress?.component == "new-revision"
-                scanAfterUpdate = updateOnly && installedNewRevision && preferences.scanNewDatabase
+                scanAfterUpdate = followUp && updateOnly && installedNewRevision && preferences.scanNewDatabase
                 if ContinuousClock.now < minimumUpdateEnd {
                     scanProgress = ScanProgress(stage: "updated", component: nil,
                                                 done: scanProgress?.done ?? 0, total: scanProgress?.total ?? 0,
@@ -1113,7 +1176,7 @@ private struct WardPreferences: Codable {
             verifiedFormulas.removeAll()
             if !background && !scanAfterUpdate { devicePath = [] }
             put(Device(id: "local", name: "This Mac", report: report))
-            checkAppsAfterScan = true
+            checkAppsAfterScan = followUp
             if result == 0 {
                 notifyNewFindings(previous: previousReport, current: report)
                 if !background && !scanAfterUpdate { selection = "local" }
@@ -1375,6 +1438,10 @@ private struct WardPreferences: Codable {
 
 @MainActor final class WardAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusMenu: WardStatusMenu?
+    override init() {
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+    }
 
     func connectStatusMenu(to model: WardModel, openPage: @escaping (String) -> Void) {
         if let statusMenu {
@@ -1422,6 +1489,7 @@ private struct WardMainWindow: View {
             .frame(minWidth: 820, minHeight: 540)
             .focusEffectDisabled()
             .onAppear {
+                model.startLaunchChecks()
                 if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
                 appDelegate.connectStatusMenu(to: model) { page in
                     model.selection = page
@@ -1585,6 +1653,7 @@ private struct WardSettingsPage: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 section("Startup", symbol: "power") {
+                    Toggle("Check database, scan and application versions on launch", isOn: $model.preferences.launchChecks)
                     Toggle("Launch Ward at login", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
                     if model.loginStatus == .requiresApproval {
                         Button("Approve in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
@@ -1593,7 +1662,7 @@ private struct WardSettingsPage: View {
                 section("Signed database", symbol: "externaldrive.fill") {
                     interval("Check for database updates", selection: $model.preferences.databaseMinutes)
                     Toggle("Download available database updates automatically", isOn: $model.preferences.downloadDatabase)
-                        .disabled(model.preferences.databaseMinutes == 0)
+                        .disabled(model.preferences.databaseMinutes == 0 && !model.preferences.launchChecks)
                     Text("Uses your selected Beacon. With automatic downloads off, Ward checks the signed manifest only.")
                         .font(.caption).foregroundStyle(.secondary)
                     if model.databaseUpdateAvailable {
@@ -1617,7 +1686,13 @@ private struct WardSettingsPage: View {
                 section("Notifications", symbol: "bell") {
                     Toggle("Application and system updates", isOn: $model.preferences.applicationNotifications)
                     Toggle("New security findings", isOn: $model.preferences.findingNotifications)
-                    Text("Applies to manual and scheduled checks.")
+                    Button("Send test notification", systemImage: "bell.badge") {
+                        Task { await model.sendTestNotification(); await refreshNotificationPermission() }
+                    }.wardGlassButton()
+                    if !model.notificationIssue.isEmpty {
+                        Label(model.notificationIssue, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
+                    }
+                    Text("Applies to launch, manual and scheduled checks.")
                         .font(.caption).foregroundStyle(.secondary)
                     if notificationAuthorization == .denied {
                         Label("macOS blocks Ward notifications. Enable them in System Settings → Notifications.", systemImage: "bell.slash")
