@@ -611,7 +611,7 @@ private struct WardPreferences: Codable {
 
     private var hasPendingLocalVersions: Bool {
         appUpdateChecks.contains { id, record in
-            record.newer && (availableAppUpdateIDs.contains(id) || NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) != nil)
+            record.newer && (availableAppUpdateIDs.contains(id) || installedApplicationURL(id) != nil)
         } || systemSoftwareUpdates.contains { $0.pendingRestart != true }
     }
 
@@ -641,7 +641,7 @@ private struct WardPreferences: Codable {
         let changes = await Task.detached {
             var changed: [String: AppUpdateRecord] = [:]
             for (id, record) in snapshot {
-                guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { continue }
+                guard let url = installedApplicationURL(id) else { continue }
                 let updated = AppUpdateReconciliation.reconcile(record, installed: AppUpdateReconciliation.installedVersion(at: url))
                 if updated != record { changed[id] = updated }
             }
@@ -1188,13 +1188,14 @@ private struct WardPreferences: Codable {
             checkingAppVersions = false
             if showProgress { applicationCheckProgress = nil }
         }
-        let apps: [Report.Inventory.Application]
+        var apps: [Report.Inventory.Application]
         if let provided {
             apps = provided
         } else {
             let scanned = devices.first(where: { $0.id == "local" })?.report.inventory.applications ?? []
             apps = scanned + outsideApplications(known: Set(scanned.map(\.identifier)), includeStandardLocations: true)
         }
+        apps = includingWard(apps)
         subscribeToVersions(apps)
         let minimumEnd = ContinuousClock.now + .milliseconds(900)
         let jobs = await Task.detached { updateJobs(for: apps) }.value
@@ -1259,7 +1260,7 @@ private struct WardPreferences: Codable {
         }
         if showProgress { applicationCheckProgress = (jobs.count + 1, jobs.count + 1) }
         for (id, record) in results {
-            let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id).flatMap { AppUpdateReconciliation.installedVersion(at: $0) }
+            let installed = installedApplicationURL(id).flatMap { AppUpdateReconciliation.installedVersion(at: $0) }
             results[id] = AppUpdateReconciliation.reconcile(record, installed: installed)
         }
         var notificationResults = results
@@ -4798,7 +4799,7 @@ private enum AppUpdateReconciliation {
 }
 
 private func currentlyNeedsAppUpdate(_ id: String, record: AppUpdateRecord) -> Bool {
-    guard record.newer, let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id),
+    guard record.newer, let url = installedApplicationURL(id),
           let version = AppUpdateReconciliation.installedVersion(at: url) else { return false }
     if let order = versionOrder(version, record.reported) { return order == .orderedAscending }
     return version == record.installed
@@ -5078,9 +5079,18 @@ private struct SparkleZip {
     var length: Int?
 }
 
+private func includingWard(_ apps: [Report.Inventory.Application]) -> [Report.Inventory.Application] {
+    guard let id = Bundle.main.bundleIdentifier, id == "com.shixpeer.ward",
+          let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else { return apps }
+    return apps.filter { $0.identifier != id } + [.init(name: "Shixpeer Ward", version: version, identifier: id, versionKind: "release")]
+}
+private func installedApplicationURL(_ identifier: String) -> URL? {
+    identifier == Bundle.main.bundleIdentifier ? Bundle.main.bundleURL : NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)
+}
+
 private func appChannel(_ app: Report.Inventory.Application) -> AppUpdateChannel {
     guard !app.identifier.isEmpty,
-          let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier) else {
+          let bundle = installedApplicationURL(app.identifier) else {
         return app.identifier.isEmpty ? .none : .missing
     }
     let info = bundle.appendingPathComponent("Contents/Info.plist")
@@ -5286,7 +5296,7 @@ private func electronFeed(_ bundle: URL) -> URL? {
 
 private func liveVersion(_ app: Report.Inventory.Application) -> String {
     guard !app.identifier.isEmpty,
-          let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier),
+          let bundle = installedApplicationURL(app.identifier),
           let plist = NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")),
           let short = plist["CFBundleShortVersionString"] as? String else { return app.version }
     let trimmed = short.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5304,7 +5314,7 @@ private func updateJobs(for applications: [Report.Inventory.Application]) -> [Ap
         case .appStore(let id):
             return AppUpdateJob(id: app.identifier, installed: installed, target: .appStore(id))
         case .sparkle(let url):
-            let bundle = NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.identifier)
+            let bundle = installedApplicationURL(app.identifier)
             let hasKey = bundle.map(sparkleHasSigningKey) ?? false
             return AppUpdateJob(id: app.identifier, installed: installed, target: .sparkle(url, hasKey))
         case .electron(let url):
@@ -7310,7 +7320,7 @@ struct ReportView: View {
     }
 
     private var listedApplications: [Report.Inventory.Application] {
-        report.inventory.applications + extraApplications
+        device.id == "local" ? includingWard(report.inventory.applications + extraApplications) : report.inventory.applications + extraApplications
     }
 
     private func updateRank(_ app: Report.Inventory.Application) -> Int {
@@ -7428,6 +7438,14 @@ struct ReportView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("Update") {
+                        if app.identifier == Bundle.main.bundleIdentifier {
+#if canImport(Sparkle)
+                            WardAppDelegate.current?.checkWardUpdates()
+#else
+                            NSWorkspace.shared.open(OfficialWardBackend.origin)
+#endif
+                            return
+                        }
                         resetUpdateQueue()
                         appInstall = AppInstallRequest(bundleID: app.identifier, name: app.name,
                                                        fromVersion: shown, toVersion: reported,
