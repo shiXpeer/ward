@@ -2,15 +2,15 @@
   "downloads": [
     {
       "arch": "arm64",
-      "version": "0.5.1",
-      "url": "https://github.com/shiXpeer/ward/releases/download/v0.5.1/Ward-0.5.1-arm64.dmg",
-      "sha256": "ac706b28c87203dc5cab3081ec780db3a0c71e6fce2b5595250cce365cb038be"
+      "version": "0.5.2",
+      "url": "https://github.com/shiXpeer/ward/releases/download/v0.5.2/Ward-0.5.2-arm64.dmg",
+      "sha256": "edc100cc4d7fe102eb256ff46735db9ccc46cf1afac06f3b636bab37f556c9cd"
     },
     {
       "arch": "x86_64",
-      "version": "0.5.1",
-      "url": "https://github.com/shiXpeer/ward/releases/download/v0.5.1/Ward-0.5.1-x86_64.dmg",
-      "sha256": "71fb0a3b1b520c6cfbbbb0cf5af0a682fc06d2b6bbd223775faa6e4af7521450"
+      "version": "0.5.2",
+      "url": "https://github.com/shiXpeer/ward/releases/download/v0.5.2/Ward-0.5.2-x86_64.dmg",
+      "sha256": "5f35487d7c571a108af951ea1c277f4aa67fb48f65be04c40bf8f06eef2dac38"
     }
   ]
 }
