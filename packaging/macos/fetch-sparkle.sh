@@ -7,4 +7,9 @@ if [[ ! -f "$archive" ]]; then
   curl --fail --location --proto '=https' --tlsv1.2 https://github.com/sparkle-project/Sparkle/releases/download/2.10.1/Sparkle-2.10.1.tar.xz -o "$archive"
 fi
 printf '%s  %s\n' 1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27 "$archive" | shasum -a 256 -c - >/dev/null
-tar -xf "$archive" -C dist/sparkle-2.10.1
+# Reuse an already extracted SDK: re-extracting in place can truncate binaries
+# while another release operation is using sign_update.
+if [[ ! -f dist/sparkle-2.10.1/.extraction-complete ]]; then
+    tar -xf "$archive" -C dist/sparkle-2.10.1
+    touch dist/sparkle-2.10.1/.extraction-complete
+fi
