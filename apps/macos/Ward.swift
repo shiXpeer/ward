@@ -6323,6 +6323,50 @@ private struct AppInstallRequest: Identifiable {
     }
 }
 
+private struct UpdateFocusPolicy {
+    let wardPID: pid_t
+    let targetID: String
+    let originalPIDs: Set<pid_t>
+    var ownsFocus: Bool
+    mutating func shouldReturnToWard(bundleID: String?, pid: pid_t) -> Bool {
+        if pid == wardPID { ownsFocus = true; return false }
+        if bundleID == targetID {
+            // Allow the old process to show save/quit dialogs, then return to Ward
+            // when its replacement starts. Only a switch to a different app opts out.
+            return ownsFocus && !originalPIDs.contains(pid)
+        }
+        ownsFocus = false
+        return false
+    }
+}
+
+@MainActor private final class UpdateFocusGuard {
+    private var policy: UpdateFocusPolicy
+    private var observer: NSObjectProtocol?
+    init(bundleID: String, originalPIDs: [pid_t]) {
+        policy = UpdateFocusPolicy(wardPID: ProcessInfo.processInfo.processIdentifier,
+            targetID: bundleID, originalPIDs: Set(originalPIDs), ownsFocus: NSApp.isActive)
+        observer = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self, let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                    if self.policy.shouldReturnToWard(bundleID: app.bundleIdentifier, pid: app.processIdentifier) {
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                }
+            }
+    }
+    func finish() {
+        // Some apps activate themselves shortly after NSWorkspace's launch callback.
+        // Stop observing promptly; a deliberate switch to another app is respected.
+        Task { [self] in
+            try? await Task.sleep(for: .seconds(2))
+            if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+            observer = nil
+        }
+    }
+}
+
 private enum AppUpdateLifecycle {
     static func isAlive(_ pid: pid_t) -> Bool {
         guard pid > 0 else { return false }
@@ -6360,13 +6404,31 @@ private enum AppUpdateLifecycle {
     }
 }
 
-/// SwiftUI's visibility preference still follows overlay scroller auto-hiding.
-/// Reserve a visible scrollbar so the queue length remains discoverable.
+/// Keep a native draggable scroll target, but draw a narrow thumb inside its gutter.
+private final class UpdateQueueThinScroller: NSScroller {
+    override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
+        let track = slotRect.insetBy(dx: max(0, (slotRect.width - 4) / 2), dy: 2)
+        NSColor.white.withAlphaComponent(0.06).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 2, yRadius: 2).fill()
+    }
+    override func drawKnob() {
+        let rect = rect(for: .knob)
+        guard rect.height > 0 else { return }
+        let thumb = rect.insetBy(dx: max(0, (rect.width - 5) / 2), dy: 2)
+        NSColor.white.withAlphaComponent(isEnabled ? 0.42 : 0.16).setFill()
+        NSBezierPath(roundedRect: thumb, xRadius: 2.5, yRadius: 2.5).fill()
+    }
+}
+
 private struct UpdateQueueScroller: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView() }
     func updateNSView(_ view: NSView, context: Context) {
         DispatchQueue.main.async {
             guard let scroll = view.enclosingScrollView else { return }
+            if !(scroll.verticalScroller is UpdateQueueThinScroller) {
+                scroll.verticalScroller = UpdateQueueThinScroller()
+            }
+            scroll.verticalScroller?.controlSize = .small
             scroll.hasVerticalScroller = true
             scroll.autohidesScrollers = false
             scroll.scrollerStyle = .legacy
@@ -7269,7 +7331,7 @@ struct ReportView: View {
             guard let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: request.bundleID) else { return false }
             return canReplaceInstalledApp(installed) || supportsAdminReplacement(installed)
         }
-        return VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(updateAllFinished ? "Updates finished" : "Install updates").font(.title3.bold())
@@ -7283,14 +7345,14 @@ struct ReportView: View {
                 Spacer()
                 Text(requests.count.formatted() + (requests.count == 1 ? " update" : " updates"))
                     .font(.callout).foregroundStyle(.secondary)
-            }.frame(height: 48, alignment: .top)
+            }.frame(height: 44, alignment: .top)
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(requests) { request in
                         applicationUpdateQueueRow(request)
                         if request.id != requests.last?.id { Divider().padding(.leading, 52) }
                     }
-                }.padding(.trailing, 8)
+                }.padding(.trailing, 24)
                     .background(UpdateQueueScroller())
             }.scrollIndicators(.visible).frame(maxWidth: .infinity, maxHeight: .infinity)
             HStack {
@@ -7314,7 +7376,7 @@ struct ReportView: View {
                     }.wardGlassButton(prominent: true).disabled(!canUpdate)
                 }
             }.frame(height: 32)
-        }.padding(20).frame(width: 600, height: 144 + min(320, max(104, CGFloat(requests.count) * 104)))
+        }.padding(18).frame(width: 600, height: 132 + min(276, max(76, CGFloat(requests.count) * 76 + CGFloat(max(0, requests.count - 1)))))
             .background(LinearGradient(colors: [Color(red: 0.16, green: 0.10, blue: 0.28), Color(red: 0.07, green: 0.06, blue: 0.14)], startPoint: .topLeading, endPoint: .bottomTrailing))
             .interactiveDismissDisabled(installing)
             .onChange(of: installStage) { _, _ in captureUpdateProgress() }
@@ -7333,7 +7395,7 @@ struct ReportView: View {
                 if request.systemUpdate != nil { Image(systemName: "gearshape.arrow.triangle.2.circlepath").resizable().scaledToFit().foregroundStyle(.blue) }
                 else { Image(nsImage: applicationIcon(request.bundleID)).resizable() }
             }.frame(width: 36, height: 36).padding(.top, 2)
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(request.name).font(.headline).lineLimit(1)
                     Spacer(minLength: 8)
@@ -7341,19 +7403,19 @@ struct ReportView: View {
                         .font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                 }
                 ProgressView(value: updateProgress[request.bundleID] ?? 0).tint(tint)
-                    .progressViewStyle(.linear).frame(height: 6)
+                    .progressViewStyle(.linear).frame(height: 4)
                     .animation(.easeInOut(duration: 0.2), value: updateProgress[request.bundleID] ?? 0)
                 HStack(alignment: .top, spacing: 6) {
                     if completed { Image(systemName: failed ? "exclamationmark.circle" : warning ? "exclamationmark.triangle" : "checkmark.circle.fill").foregroundStyle(tint) }
-                    Text(status).font(.callout).foregroundStyle(failed || warning ? tint : .secondary)
+                    Text(status).font(.caption).foregroundStyle(failed || warning ? tint : .secondary)
                         .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading).help(status)
                     if active && installTotal > 0 {
                         Text("\(Int(Double(min(installBytes, installTotal)) / Double(installTotal) * 100))%")
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
-                }.frame(height: 32, alignment: .top)
+                }.frame(height: 28, alignment: .top)
             }
-        }.padding(.vertical, 12).frame(height: 104)
+        }.padding(.vertical, 8).frame(height: 76)
     }
 
     private func captureUpdateProgress() {
@@ -7646,6 +7708,8 @@ struct ReportView: View {
             $0.bundleURL?.resolvingSymlinksInPath() == target && AppUpdateLifecycle.isAlive($0.processIdentifier)
         }
         let originalPIDs = originalProcesses.map(\.processIdentifier)
+        let focus = UpdateFocusGuard(bundleID: request.bundleID, originalPIDs: originalPIDs)
+        defer { focus.finish() }
         let originalTeam = await Task.detached { signingTeam(installed) }.value
         func verifyInstalled() async throws {
             try await Task.detached {
